@@ -1,5 +1,5 @@
 """
-Proyecto Tienda Virtual — visor CSV + PostgreSQL + tablero (Streamlit).
+Proyecto Tienda Virtual — visor CSV + base de datos Supabase + tablero (Streamlit).
 Versión unificada para despliegue web (p. ej. Streamlit Community Cloud).
 """
 from __future__ import annotations
@@ -136,7 +136,7 @@ def dataframe_to_postgres(
             )
     except Exception as e:
         raise RuntimeError(
-            f"Falló la carga en PostgreSQL (public.{table_name}): {e}"
+            f"Falló la carga en la base de datos (public.{table_name}): {e}"
         ) from e
 
     rows_after = _count_rows()
@@ -786,8 +786,8 @@ def render_tablero(
                         st.error(f"Error al guardar en la base de datos: {e}")
             else:
                 st.caption(
-                    "Los avances en Siciap / entrega solo se guardan en PostgreSQL "
-                    "cuando cargás datos desde la base (no desde CSV)."
+                    "Los avances en Siciap / entrega solo se guardan en la base de datos "
+                    "cuando cargás datos desde la sección Base de Datos (no desde CSV)."
                 )
 
     st.download_button(
@@ -802,126 +802,185 @@ def render_tablero(
 # ==========================================
 # 5. APLICACIÓN PRINCIPAL
 # ==========================================
+def check_password() -> bool:
+    """Retorna True si el usuario ingresó las credenciales correctas.
+
+    Nota: credenciales fijas son adecuadas solo para equipos cerrados; para mayor
+    seguridad usá variables de entorno o un proveedor de identidad.
+    """
+    if "authenticated" not in st.session_state:
+        st.session_state["authenticated"] = False
+
+    if st.session_state["authenticated"]:
+        return True
+
+    st.sidebar.title("Acceso restringido")
+    user = st.sidebar.text_input("Usuario", key="auth_user")
+    password = st.sidebar.text_input("Contraseña", type="password", key="auth_pass")
+
+    if st.sidebar.button("Entrar", key="auth_btn"):
+        if user == "stock_dggies" and password == "stock_dggiesmspbs":
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.sidebar.error("Usuario o contraseña incorrectos")
+    return False
+
+
 st.set_page_config(page_title="Tienda Virtual", layout="wide", page_icon="🛒")
 
 st.title("🛒 Tienda virtual — datos DNCP")
-st.caption(
-    "Subí un CSV o leé desde PostgreSQL. El tablero resume montos y proveedores; al seleccionar una fila podés cargar datos complementarios debajo."
-)
 
-fuente = st.sidebar.radio("Origen de datos", ("Archivo CSV", "PostgreSQL"), horizontal=True)
+if not check_password():
+    st.warning(
+        "Iniciá sesión desde el panel lateral para acceder al sistema (Stock DGGIES)."
+    )
+    st.stop()
 
-st.sidebar.markdown("---")
+tab_instr, tab_app = st.tabs(["📋 Instructivo de uso", "🛒 Aplicación"])
 
-# Nombre de tabla fijo por código / variable de entorno TV_TABLE (sin campo en la UI)
-tabla_pg = os.environ.get("TV_TABLE", DEFAULT_TABLE)
+with tab_instr:
+    st.subheader("Instructivo de uso")
+    st.markdown(
+        """
+1. Descargar el archivo CSV de la DNCP desde:  
+   [https://www.contrataciones.gov.py/t/download/SieDocumento/10](https://www.contrataciones.gov.py/t/download/SieDocumento/10)
 
-if fuente == "Archivo CSV":
-    for _k in ("ss_df_uoc", "ss_df_pg_full", "ss_pg_active"):
-        st.session_state.pop(_k, None)
+2. Ir a la pestaña **Aplicación** → sección **Archivo CSV** en esta app y subir el archivo descargado.
 
-    st.subheader("Cargar CSV")
-    uploaded = st.file_uploader("Subir CSV (tienda órdenes, reporte compras, etc.)", type=["csv"])
-    ruta = st.text_input("O ruta absoluta a un .csv (solo útil en tu PC local)", value="")
+3. Hacer clic en **Cargar este DataFrame a la Base de Datos** (sobrescribe la tabla con los datos más recientes).
 
-    df: pd.DataFrame | None = None
-    err = None
-    if uploaded is not None:
-        try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
-                tmp.write(uploaded.getvalue())
-                path = tmp.name
-            df = read_csv_smart(path)
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
-        except Exception as e:
-            err = str(e)
-    elif ruta.strip():
-        try:
-            df = read_csv_smart(ruta.strip())
-        except Exception as e:
-            err = str(e)
+4. Para gestionar la logística: pestaña **Aplicación** → **Base de Datos (Supabase)** → **Ver Reporte (MSPBS - UOC)**.
+        """
+    )
 
-    if err:
-        st.error(err)
-    elif df is None:
-        st.info("Subí un archivo para visualizar los datos.")
-    else:
-        st.success(f"{len(df):,} filas × {len(df.columns)} columnas")
-        render_tablero(df, titulo="Vista desde archivo CSV", key_prefix="tv_csv")
+with tab_app:
+    st.caption(
+        "Subí un CSV o conectate a la base de datos. El tablero resume montos y proveedores; "
+        "al seleccionar una fila podés cargar datos complementarios debajo."
+    )
 
-        st.markdown("---")
-        st.subheader("Opcional: enviar a PostgreSQL")
-        modo = st.radio("Modo de carga", ("replace (reemplaza tabla)", "append (agrega filas)"), horizontal=True)
-        if st.button("Cargar este DataFrame a PostgreSQL"):
-            try:
-                if_exists = "replace" if modo.startswith("replace") else "append"
-                esperado, verificado = subir_a_postgresql(
-                    df, tabla_pg, if_exists=if_exists
-                )
-                st.success(
-                    f"✅ CARGA EXITOSA: **{verificado:,}** filas verificadas en la nube "
-                    f"(`public.{tabla_pg}`, modo `{if_exists}`; CSV: {esperado:,})."
-                )
-            except Exception as e:
-                st.error(f"❌ Error en la carga o verificación: {e}")
-
-else:
-    st.subheader("Lectura desde PostgreSQL")
-
-    st.sidebar.markdown("#### Consultas")
-    if st.sidebar.button("📦 Ver reporte: MSPBS – UOC Central (D.O.C)", key="btn_uoc_central"):
-        try:
-            engine = get_engine()
-            if not table_exists(engine, "contrataciones_datos"):
-                st.warning("No existe la tabla `contrataciones_datos` en public.")
-            else:
-                with st.spinner("Consultando datos del Nivel Central..."):
-                    df_uoc = get_uoc_central_data(engine)
-                if df_uoc.empty:
-                    st.session_state.pop("ss_df_uoc", None)
-                    st.session_state.pop("ss_pg_active", None)
-                    st.warning("No se encontraron registros con los filtros indicados.")
-                else:
-                    st.session_state["ss_df_uoc"] = df_uoc
-                    st.session_state["ss_pg_active"] = "uoc"
-        except Exception as e:
-            st.error(f"Error en la conexión o consulta: {e}")
+    FUENTE_BD = "Base de Datos (Supabase)"
+    fuente = st.sidebar.radio(
+        "Origen de datos", ("Archivo CSV", FUENTE_BD), horizontal=True
+    )
 
     st.sidebar.markdown("---")
 
-    if st.sidebar.button("Leer tabla completa", key="btn_lectura_tabla"):
-        try:
-            engine = get_engine()
-            if not table_exists(engine, tabla_pg):
-                st.warning(f"No existe la tabla `{tabla_pg}` en public.")
-            else:
-                with st.spinner("Cargando todos los registros..."):
-                    df_pg = obtener_datos_completos(engine, tabla_pg)
-                st.session_state["ss_df_pg_full"] = df_pg
-                st.session_state["ss_pg_active"] = "pg_full"
-        except Exception as e:
-            st.error(str(e))
+    # Nombre de tabla fijo por código / variable de entorno TV_TABLE (sin campo en la UI)
+    tabla_pg = os.environ.get("TV_TABLE", DEFAULT_TABLE)
 
-    active = st.session_state.get("ss_pg_active")
-    if active == "uoc" and st.session_state.get("ss_df_uoc") is not None:
-        df_uoc = st.session_state["ss_df_uoc"]
-        if not df_uoc.empty:
-            st.success(f"Reporte generado con éxito: {len(df_uoc):,} registros.")
+    if fuente == "Archivo CSV":
+        for _k in ("ss_df_uoc", "ss_df_pg_full", "ss_pg_active"):
+            st.session_state.pop(_k, None)
+
+        st.subheader("Cargar CSV")
+        uploaded = st.file_uploader(
+            "Subir CSV (tienda órdenes, reporte compras, etc.)", type=["csv"]
+        )
+        ruta = st.text_input(
+            "O ruta absoluta a un .csv (solo útil en tu PC local)", value=""
+        )
+
+        df: pd.DataFrame | None = None
+        err = None
+        if uploaded is not None:
+            try:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
+                    tmp.write(uploaded.getvalue())
+                    path = tmp.name
+                df = read_csv_smart(path)
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+            except Exception as e:
+                err = str(e)
+        elif ruta.strip():
+            try:
+                df = read_csv_smart(ruta.strip())
+            except Exception as e:
+                err = str(e)
+
+        if err:
+            st.error(err)
+        elif df is None:
+            st.info("Subí un archivo para visualizar los datos.")
+        else:
+            st.success(f"{len(df):,} filas × {len(df.columns)} columnas")
+            render_tablero(df, titulo="Vista desde archivo CSV", key_prefix="tv_csv")
+
+            st.markdown("---")
+            st.subheader("Enviar a la base de datos (Supabase)")
+            st.caption("La carga **reemplaza** por completo la tabla con los datos del CSV actual.")
+            if st.button("Cargar este DataFrame a la Base de Datos"):
+                try:
+                    esperado, verificado = subir_a_postgresql(
+                        df, tabla_pg, if_exists="replace"
+                    )
+                    st.success(
+                        f"✅ CARGA EXITOSA: **{verificado:,}** filas verificadas en la nube "
+                        f"(`public.{tabla_pg}`; CSV: {esperado:,})."
+                    )
+                except Exception as e:
+                    st.error(f"❌ Error en la carga o verificación: {e}")
+
+    else:
+        st.subheader("Lectura desde Base de Datos (Supabase)")
+
+        st.sidebar.markdown("#### Consultas")
+        if st.sidebar.button("Ver Reporte (MSPBS - UOC)", key="btn_uoc_central"):
+            try:
+                engine = get_engine()
+                if not table_exists(engine, "contrataciones_datos"):
+                    st.warning("No existe la tabla `contrataciones_datos` en public.")
+                else:
+                    with st.spinner("Consultando datos del Nivel Central..."):
+                        df_uoc = get_uoc_central_data(engine)
+                    if df_uoc.empty:
+                        st.session_state.pop("ss_df_uoc", None)
+                        st.session_state.pop("ss_pg_active", None)
+                        st.warning(
+                            "No se encontraron registros con los filtros indicados."
+                        )
+                    else:
+                        st.session_state["ss_df_uoc"] = df_uoc
+                        st.session_state["ss_pg_active"] = "uoc"
+            except Exception as e:
+                st.error(f"Error en la conexión o consulta: {e}")
+
+        st.sidebar.markdown("---")
+
+        if st.sidebar.button("Leer tabla completa", key="btn_lectura_tabla"):
+            try:
+                engine = get_engine()
+                if not table_exists(engine, tabla_pg):
+                    st.warning(f"No existe la tabla `{tabla_pg}` en public.")
+                else:
+                    with st.spinner("Cargando todos los registros..."):
+                        df_pg = obtener_datos_completos(engine, tabla_pg)
+                    st.session_state["ss_df_pg_full"] = df_pg
+                    st.session_state["ss_pg_active"] = "pg_full"
+            except Exception as e:
+                st.error(str(e))
+
+        active = st.session_state.get("ss_pg_active")
+        if active == "uoc" and st.session_state.get("ss_df_uoc") is not None:
+            df_uoc = st.session_state["ss_df_uoc"]
+            if not df_uoc.empty:
+                st.success(f"Reporte generado con éxito: {len(df_uoc):,} registros.")
+                render_tablero(
+                    df_uoc,
+                    titulo="MSPBS – UOC Nivel Central (D.O.C)",
+                    key_prefix="tv_uoc",
+                    persist_complementarios_db=True,
+                )
+        elif active == "pg_full" and st.session_state.get("ss_df_pg_full") is not None:
+            df_pg = st.session_state["ss_df_pg_full"]
+            st.success(f"{len(df_pg):,} filas cargadas en total")
             render_tablero(
-                df_uoc,
-                titulo="MSPBS – UOC Nivel Central (D.O.C)",
-                key_prefix="tv_uoc",
+                df_pg,
+                titulo="Vista desde Base de Datos (Supabase) — tabla completa",
+                key_prefix="tv_pg",
                 persist_complementarios_db=True,
             )
-    elif active == "pg_full" and st.session_state.get("ss_df_pg_full") is not None:
-        df_pg = st.session_state["ss_df_pg_full"]
-        st.success(f"{len(df_pg):,} filas cargadas en total")
-        render_tablero(
-            df_pg,
-            titulo="Vista desde PostgreSQL (Completa)",
-            key_prefix="tv_pg",
-            persist_complementarios_db=True,
-        )
