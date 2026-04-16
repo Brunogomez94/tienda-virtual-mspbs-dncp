@@ -1,0 +1,23 @@
+# Streamlit (credenciales locales; en Cloud usás "Secrets")
+.streamlit/
+
+# Entornos virtuales
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.so
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Logs y entornos
+*.log
+.env
+.env.local
