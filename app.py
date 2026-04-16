@@ -8,6 +8,7 @@ import csv
 import os
 import re
 import tempfile
+from urllib.parse import quote_plus
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, Optional
@@ -120,11 +121,15 @@ def dataframe_to_postgres(
 
     try:
         with engine.begin() as conn:
+            # replace: limpiar antes de crear de nuevo (evita choques de esquema / restos)
+            if if_exists == "replace":
+                conn.execute(text(f"DROP TABLE IF EXISTS public.{table_name} CASCADE"))
+            # Tras DROP, siempre append (tabla nueva); en modo append, agregar a la existente
             df.to_sql(
                 table_name,
                 con=conn,
                 schema=schema,
-                if_exists=if_exists,
+                if_exists="append",
                 index=False,
                 chunksize=chunksize,
                 method="multi",
@@ -195,11 +200,18 @@ def get_postgres_params() -> Dict[str, object]:
 def build_connection_url(params: Optional[Dict[str, object]] = None) -> str:
     p = params or get_postgres_params()
     pw = p.get("password") or ""
-    user = p["user"]
-    host = p["host"]
-    port = p["port"]
-    db = p["database"]
-    return f"postgresql://{user}:{pw}@{host}:{port}/{db}"
+    user = str(p["user"])
+    host = str(p["host"])
+    port = int(p["port"])
+    db = str(p["database"])
+    # Caracteres especiales en usuario/clave no rompen la URL
+    uq = quote_plus(user)
+    pq = quote_plus(pw)
+    url = f"postgresql://{uq}:{pq}@{host}:{port}/{db}"
+    # Pooler / Supabase en la nube requieren TLS
+    if "supabase" in host.lower():
+        url = f"{url}?sslmode=require"
+    return url
 
 
 def get_engine() -> "Engine":
