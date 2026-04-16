@@ -95,19 +95,60 @@ def dataframe_to_postgres(
     table_name: str,
     schema: str = "public",
     if_exists: str = "replace",
-    chunksize: int = 5000,
-) -> int:
-    n = len(df)
-    df.to_sql(
-        table_name,
-        engine,
-        schema=schema,
-        if_exists=if_exists,
-        index=False,
-        chunksize=chunksize,
-        method="multi",
-    )
-    return n
+    chunksize: int = 1000,
+) -> tuple[int, int]:
+    """
+    Carga el DataFrame en public.<tabla> con transacción explícita.
+    Devuelve (filas en el DataFrame, filas contadas en BD tras COMMIT).
+    """
+    # Siempre public: evita confusiones con otros esquemas.
+    schema = "public"
+    table_name = _validate_sql_identifier(table_name)
+    expected = len(df)
+
+    def _count_rows() -> int:
+        with engine.connect() as conn:
+            r = conn.execute(
+                text(f"SELECT COUNT(*) FROM public.{table_name}")
+            ).scalar()
+        return int(r or 0)
+
+    rows_before = 0
+    if if_exists == "append" and table_exists(engine, table_name):
+        rows_before = _count_rows()
+
+    try:
+        with engine.begin() as conn:
+            df.to_sql(
+                table_name,
+                con=conn,
+                schema=schema,
+                if_exists=if_exists,
+                index=False,
+                chunksize=chunksize,
+            )
+    except Exception as e:
+        raise RuntimeError(
+            f"Falló la carga en PostgreSQL (public.{table_name}): {e}"
+        ) from e
+
+    rows_after = _count_rows()
+
+    if if_exists == "replace":
+        if rows_after != expected:
+            raise RuntimeError(
+                f"Verificación fallida: el archivo tiene {expected:,} filas pero "
+                f"public.{table_name} tiene {rows_after:,} tras el COMMIT."
+            )
+    else:
+        inserted = rows_after - rows_before
+        if inserted != expected:
+            raise RuntimeError(
+                f"Verificación fallida: se esperaban {expected:,} filas nuevas; "
+                f"incremento observado: {inserted:,} (antes {rows_before:,}, después {rows_after:,})."
+            )
+
+    return expected, rows_after
 
 
 # ==========================================
@@ -148,11 +189,33 @@ def build_connection_url(params: Optional[Dict[str, object]] = None) -> str:
 
 def get_engine() -> "Engine":
     params = get_postgres_params()
-    return create_engine(
+    engine = create_engine(
         build_connection_url(params),
         connect_args={"client_encoding": "utf8"},
         pool_pre_ping=True,
     )
+    inicializar_base_de_datos(engine)
+    return engine
+
+
+def inicializar_base_de_datos(engine: "Engine") -> None:
+    """Crea las tablas necesarias si no existen (p. ej. logística complementaria en Supabase)."""
+    _validate_sql_identifier(COMPLEMENTARIOS_TABLE)
+    sql_complementaria = text(
+        f"""
+        CREATE TABLE IF NOT EXISTS public.{COMPLEMENTARIOS_TABLE} (
+            nro_orden_compra VARCHAR(255) NOT NULL,
+            descripcion_producto TEXT NOT NULL,
+            codigo_siciap VARCHAR(100),
+            lugar_entrega VARCHAR(255),
+            cantidad_entregada NUMERIC DEFAULT 0,
+            ultima_actualizacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (nro_orden_compra, descripcion_producto)
+        );
+        """
+    )
+    with engine.begin() as conn:
+        conn.execute(sql_complementaria)
 
 
 def _validate_sql_identifier(name: str) -> str:
@@ -169,23 +232,8 @@ def read_table_sql(engine: "Engine", table: str) -> pd.DataFrame:
 
 
 def ensure_datos_complementarios_table(engine: "Engine") -> None:
-    """Crea public.datos_complementarios_oc si no existe (idempotente)."""
-    _validate_sql_identifier(COMPLEMENTARIOS_TABLE)
-    ddl = text(
-        f"""
-        CREATE TABLE IF NOT EXISTS public.{COMPLEMENTARIOS_TABLE} (
-            nro_orden_compra VARCHAR(255) NOT NULL,
-            descripcion_producto TEXT NOT NULL,
-            codigo_siciap VARCHAR(100),
-            lugar_entrega VARCHAR(255),
-            cantidad_entregada NUMERIC DEFAULT 0,
-            ultima_actualizacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (nro_orden_compra, descripcion_producto)
-        );
-        """
-    )
-    with engine.begin() as conn:
-        conn.execute(ddl)
+    """Alias idempotente: misma lógica que inicializar_base_de_datos."""
+    inicializar_base_de_datos(engine)
 
 
 def _read_datos_complementarios(engine: "Engine") -> pd.DataFrame:
@@ -260,7 +308,6 @@ def merge_con_datos_complementarios(
 
 def obtener_datos_completos(engine: "Engine", tabla_principal: str) -> pd.DataFrame:
     """Lee la tabla principal y une avances de logística desde datos_complementarios_oc."""
-    ensure_datos_complementarios_table(engine)
     df_principal = read_table_sql(engine, tabla_principal)
     df_comp = _read_datos_complementarios(engine)
     return merge_con_datos_complementarios(df_principal, df_comp)
@@ -305,7 +352,6 @@ def get_uoc_central_data(engine: "Engine") -> pd.DataFrame:
     )
     with engine.connect() as conn:
         df_principal = pd.read_sql(query, conn)
-    ensure_datos_complementarios_table(engine)
     df_comp = _read_datos_complementarios(engine)
     return merge_con_datos_complementarios(df_principal, df_comp)
 
@@ -671,7 +717,6 @@ def render_tablero(
                     )
                     try:
                         engine = get_engine()
-                        ensure_datos_complementarios_table(engine)
                         with engine.begin() as conn:
                             for form_i, (_, row) in enumerate(d_edit.iterrows()):
                                 raw_n5 = row.get("n5")
@@ -787,8 +832,13 @@ if fuente == "Archivo CSV":
             try:
                 engine = get_engine()
                 if_exists = "replace" if modo.startswith("replace") else "append"
-                n = dataframe_to_postgres(df, engine, tabla_pg, if_exists=if_exists)
-                st.success(f"Listo: {n:,} filas → public.{tabla_pg} ({if_exists})")
+                esperado, verificado = dataframe_to_postgres(
+                    df, engine, tabla_pg, if_exists=if_exists
+                )
+                st.success(
+                    f"Listo: **{verificado:,}** filas confirmadas en `public.{tabla_pg}` "
+                    f"(origen CSV: {esperado:,}; modo `{if_exists}`)."
+                )
             except Exception as e:
                 st.error(f"No se pudo conectar o escribir: {e}")
 
