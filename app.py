@@ -95,10 +95,11 @@ def dataframe_to_postgres(
     table_name: str,
     schema: str = "public",
     if_exists: str = "replace",
-    chunksize: int = 1000,
+    chunksize: int = 500,
 ) -> tuple[int, int]:
     """
     Carga el DataFrame en public.<tabla> con transacción explícita.
+    Paquetes pequeños (500) + method='multi' para inserciones eficientes pero controladas.
     Devuelve (filas en el DataFrame, filas contadas en BD tras COMMIT).
     """
     # Siempre public: evita confusiones con otros esquemas.
@@ -126,6 +127,7 @@ def dataframe_to_postgres(
                 if_exists=if_exists,
                 index=False,
                 chunksize=chunksize,
+                method="multi",
             )
     except Exception as e:
         raise RuntimeError(
@@ -137,18 +139,31 @@ def dataframe_to_postgres(
     if if_exists == "replace":
         if rows_after != expected:
             raise RuntimeError(
-                f"Verificación fallida: el archivo tiene {expected:,} filas pero "
-                f"public.{table_name} tiene {rows_after:,} tras el COMMIT."
+                f"DISCREPANCIA: se intentaron subir {expected:,} filas pero en la nube "
+                f"hay {rows_after:,} en public.{table_name}."
             )
     else:
         inserted = rows_after - rows_before
         if inserted != expected:
             raise RuntimeError(
-                f"Verificación fallida: se esperaban {expected:,} filas nuevas; "
+                f"DISCREPANCIA: se esperaban {expected:,} filas nuevas; "
                 f"incremento observado: {inserted:,} (antes {rows_before:,}, después {rows_after:,})."
             )
 
     return expected, rows_after
+
+
+def subir_a_postgresql(
+    df: pd.DataFrame,
+    tabla_nombre: str,
+    *,
+    if_exists: str = "replace",
+) -> tuple[int, int]:
+    """
+    Fuerza bruta controlada: mismo motor que el tablero, paquetes de 500, verificación COUNT(*).
+    """
+    engine = get_engine()
+    return dataframe_to_postgres(df, engine, tabla_nombre, if_exists=if_exists)
 
 
 # ==========================================
@@ -830,17 +845,16 @@ if fuente == "Archivo CSV":
         modo = st.radio("Modo de carga", ("replace (reemplaza tabla)", "append (agrega filas)"), horizontal=True)
         if st.button("Cargar este DataFrame a PostgreSQL"):
             try:
-                engine = get_engine()
                 if_exists = "replace" if modo.startswith("replace") else "append"
-                esperado, verificado = dataframe_to_postgres(
-                    df, engine, tabla_pg, if_exists=if_exists
+                esperado, verificado = subir_a_postgresql(
+                    df, tabla_pg, if_exists=if_exists
                 )
                 st.success(
-                    f"Listo: **{verificado:,}** filas confirmadas en `public.{tabla_pg}` "
-                    f"(origen CSV: {esperado:,}; modo `{if_exists}`)."
+                    f"✅ CARGA EXITOSA: **{verificado:,}** filas verificadas en la nube "
+                    f"(`public.{tabla_pg}`, modo `{if_exists}`; CSV: {esperado:,})."
                 )
             except Exception as e:
-                st.error(f"No se pudo conectar o escribir: {e}")
+                st.error(f"❌ Error en la carga o verificación: {e}")
 
 else:
     st.subheader("Lectura desde PostgreSQL")
