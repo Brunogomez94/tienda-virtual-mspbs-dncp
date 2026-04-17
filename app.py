@@ -43,6 +43,17 @@ CATALOGO_STOCK_TABLE = "catalogo_stock_critico"
 DNCP_HTTP_HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; TiendaVirtualMSPBS/1.1)",
 }
+# CSV incluidos en `data/dncp/` (copiados desde los reportes DNCP; separador `;`).
+DNCP_PAQUETE_DIR = Path(__file__).resolve().parent / "data" / "dncp"
+DNCP_ARCHIVOS_COMPRAS_LOCAL: dict[str, str] = {
+    "400275": "compras_400275.csv",
+    "395261": "compras_395261.csv",
+    "386038": "compras_386038.csv",
+    "382392": "compras_382392.csv",
+}
+# Vista pública típica de una orden de compra (portal DNCP usa el id de la primera columna del CSV).
+DNCP_URL_VER_OC_BASE = "https://www.contrataciones.gov.py/ordenes-de-compra/"
+
 DNCP_CONVENIOS_PRIORITARIOS: list[dict[str, str]] = [
     {
         "id": "400275",
@@ -857,6 +868,106 @@ def resumen_convenio_dncp_cached(csv_url: str) -> dict[str, object]:
         return {"ok": False, "error": str(e)[:400]}
 
 
+def leer_compras_csv_local(path: Path) -> pd.DataFrame:
+    """Lee un compras.csv exportado del DNCP (local)."""
+    for enc in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            return pd.read_csv(
+                path,
+                sep=";",
+                encoding=enc,
+                on_bad_lines="skip",
+                low_memory=False,
+            )
+        except UnicodeDecodeError:
+            continue
+    return pd.read_csv(
+        path,
+        sep=";",
+        encoding_errors="replace",
+        on_bad_lines="skip",
+        low_memory=False,
+    )
+
+
+def url_publica_orden_compra_dncp(oc_id: object) -> str:
+    """Arma la URL de la OC en el portal (columna `id` del CSV)."""
+    s = str(oc_id).strip()
+    if not s or s.lower() in ("nan", "none", ""):
+        return ""
+    return f"{DNCP_URL_VER_OC_BASE}{s}"
+
+
+@st.cache_data(show_spinner=False)
+def tablas_enlace_dncp_desde_paquete_local() -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Lee `data/dncp/compras_*.csv`. Devuelve:
+    - resumen: ID, nombre convenio, cantidad OC, proveedores (texto).
+    - detalle: convenio, número OC, fecha, proveedor, URL (para LinkColumn).
+    """
+    res_filas: list[dict[str, object]] = []
+    partes: list[pd.DataFrame] = []
+    for conv in DNCP_CONVENIOS_PRIORITARIOS:
+        cid = conv["id"]
+        fname = DNCP_ARCHIVOS_COMPRAS_LOCAL.get(cid)
+        if not fname:
+            continue
+        path = DNCP_PAQUETE_DIR / fname
+        if not path.is_file():
+            res_filas.append(
+                {
+                    "ID": cid,
+                    "Nombre del convenio": conv["nombre"],
+                    "Órdenes de compra emitidas": 0,
+                    "Proveedor(es)": f"⚠️ Falta `{path.name}` en **data/dncp/**",
+                }
+            )
+            continue
+        df = leer_compras_csv_local(path)
+        n_oc, prov_txt = metricas_oc_y_proveedores_compras(df)
+        res_filas.append(
+            {
+                "ID": cid,
+                "Nombre del convenio": conv["nombre"],
+                "Órdenes de compra emitidas": n_oc,
+                "Proveedor(es)": prov_txt,
+            }
+        )
+        d = df.copy()
+        d["_convenio_id"] = cid
+        partes.append(d)
+    resumen = pd.DataFrame(res_filas)
+    if not partes:
+        return resumen, pd.DataFrame()
+    todo = pd.concat(partes, ignore_index=True)
+    if "fecha_orden_compra" in todo.columns:
+        fechas = pd.to_datetime(todo["fecha_orden_compra"], errors="coerce")
+        todo["Fecha de emisión"] = fechas.dt.strftime("%Y-%m-%d %H:%M")
+    else:
+        todo["Fecha de emisión"] = ""
+    if "nro_orden_compra" in todo.columns:
+        todo["Orden de compra"] = todo["nro_orden_compra"].astype(str).str.strip()
+    else:
+        todo["Orden de compra"] = ""
+    if "proveedor" in todo.columns:
+        todo["Proveedor"] = todo["proveedor"].astype(str).str.strip()
+    else:
+        todo["Proveedor"] = ""
+    if "id" not in todo.columns:
+        return resumen, pd.DataFrame()
+    todo["Ver OC (DNCP)"] = todo["id"].apply(url_publica_orden_compra_dncp)
+    vista = todo[
+        [
+            "_convenio_id",
+            "Orden de compra",
+            "Fecha de emisión",
+            "Proveedor",
+            "Ver OC (DNCP)",
+        ]
+    ].rename(columns={"_convenio_id": "ID convenio"})
+    return resumen, vista
+
+
 def _aplicar_catalogo_stock_critico(d0: pd.DataFrame) -> pd.DataFrame:
     """LEFT JOIN con catalogo_stock_critico: si hay SICIAP, reemplaza n5 por descripcion_oficial."""
     if "n5" not in d0.columns or "codigo_siciap" not in d0.columns:
@@ -1499,42 +1610,20 @@ with tab_instr:
 with tab_enlaces:
     st.subheader("Convenios prioritarios (Nivel Central / COVID)")
     st.caption(
-        "La tabla se arma **descargando en vivo** cada `compras.csv` del DNCP "
-        "(separador `;`). Las órdenes son **número distinto de `nro_orden_compra`**; "
-        "proveedores: resumen de empresas en ese CSV."
+        "Los datos salen de los CSV guardados en **`data/dncp/`** del proyecto "
+        "(mismo formato que los reportes `compras.csv` del DNCP, separador `;`). "
+        "Actualizá esos archivos cuando descargues nuevos reportes y pulsá **Recargar**."
     )
-    if st.button("🔄 Actualizar datos desde DNCP", key="dncp_refresh_enlaces"):
-        resumen_convenio_dncp_cached.clear()
+    if st.button("🔄 Recargar tablas desde archivos locales", key="dncp_reload_local"):
+        tablas_enlace_dncp_desde_paquete_local.clear()
         st.rerun()
 
-    filas_enlaces: list[dict[str, object]] = []
-    with st.spinner("Consultando DNCP (cuatro convenios)…"):
-        for conv in DNCP_CONVENIOS_PRIORITARIOS:
-            res = resumen_convenio_dncp_cached(conv["csv_url"])
-            if res.get("ok"):
-                filas_enlaces.append(
-                    {
-                        "ID": conv["id"],
-                        "Nombre del convenio": conv["nombre"],
-                        "Órdenes de compra emitidas": int(res["n_oc"]),
-                        "Proveedor(es)": str(res["proveedores"]),
-                        "Link": conv["csv_url"],
-                    }
-                )
-            else:
-                filas_enlaces.append(
-                    {
-                        "ID": conv["id"],
-                        "Nombre del convenio": conv["nombre"],
-                        "Órdenes de compra emitidas": 0,
-                        "Proveedor(es)": f"⚠️ {res.get('error', 'Error al leer CSV')}",
-                        "Link": conv["csv_url"],
-                    }
-                )
+    with st.spinner("Leyendo CSV locales…"):
+        df_resumen, df_detalle = tablas_enlace_dncp_desde_paquete_local()
 
-    df_enlaces = pd.DataFrame(filas_enlaces)
+    st.markdown("##### Resumen por convenio")
     st.dataframe(
-        df_enlaces,
+        df_resumen,
         column_config={
             "ID": st.column_config.TextColumn("ID", width="small"),
             "Nombre del convenio": st.column_config.TextColumn(
@@ -1547,18 +1636,42 @@ with tab_enlaces:
             "Proveedor(es)": st.column_config.TextColumn(
                 "Proveedor(es)", width="large"
             ),
-            "Link": st.column_config.LinkColumn(
-                "Descargar CSV DNCP", display_text="📥 CSV compras"
-            ),
         },
         hide_index=True,
         width="stretch",
     )
+
+    st.markdown("##### Detalle — órdenes de compra")
     st.caption(
-        "**Ficha web del convenio:** quitá `/compras.csv` del mismo enlace o abrilo desde el portal DNCP. "
-        "Para sumar más convenios, editá `DNCP_CONVENIOS_PRIORITARIOS` en `app.py`. "
-        "Caché ~30 min o **Actualizar desde DNCP**."
+        "Cada **Ver OC** apunta al portal DNCP usando el identificador `id` del CSV. "
+        "Si alguna URL no abre (cambios del portal), buscá por **orden de compra** o **código de contratación** en el sitio oficial."
     )
+    if df_detalle.empty:
+        st.warning(
+            "No hay filas para mostrar. Copiá los cuatro `compras_*.csv` en "
+            f"`{DNCP_PAQUETE_DIR}` y volvé a **Recargar**."
+        )
+    else:
+        st.dataframe(
+            df_detalle,
+            column_config={
+                "ID convenio": st.column_config.TextColumn("ID convenio", width="small"),
+                "Orden de compra": st.column_config.TextColumn(
+                    "Orden de compra", width="medium"
+                ),
+                "Fecha de emisión": st.column_config.TextColumn(
+                    "Fecha de emisión", width="medium"
+                ),
+                "Proveedor": st.column_config.TextColumn("Proveedor", width="large"),
+                "Ver OC (DNCP)": st.column_config.LinkColumn(
+                    "Abrir en web", display_text="🔗 Ver OC"
+                ),
+            },
+            hide_index=True,
+            width="stretch",
+            height=520,
+        )
+        st.caption(f"**{len(df_detalle):,}** órdenes listadas (cuatro convenios).")
 
 with tab_carga:
     st.caption(
