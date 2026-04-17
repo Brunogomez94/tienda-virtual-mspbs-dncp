@@ -9,6 +9,8 @@ import os
 import re
 import tempfile
 import unicodedata
+import urllib.request
+from io import BytesIO
 from urllib.parse import quote_plus
 from datetime import date, datetime
 from pathlib import Path
@@ -36,6 +38,33 @@ DEFAULT_TABLE = os.environ.get("TV_TABLE", "contrataciones_datos")
 COMPLEMENTARIOS_TABLE = "datos_complementarios_oc"
 AGENDAMIENTOS_TABLE = "agendamientos_entregas"
 CATALOGO_STOCK_TABLE = "catalogo_stock_critico"
+
+# Convenios DNCP — compras.csv (CSV usa separador ;)
+DNCP_HTTP_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; TiendaVirtualMSPBS/1.1)",
+}
+DNCP_CONVENIOS_PRIORITARIOS: list[dict[str, str]] = [
+    {
+        "id": "400275",
+        "nombre": "Uso médico lucha COVID-19 Grupo 2",
+        "csv_url": "https://www.contrataciones.gov.py/convenios-marco/convenio/400275-adquisicion-productos-uso-medico-lucha-covid-19-grupo-2/compras.csv",
+    },
+    {
+        "id": "395261",
+        "nombre": "Midazolam y atracurio besilato",
+        "csv_url": "https://www.contrataciones.gov.py/convenios-marco/convenio/395261-adquisicion-midazolam-atracurio-besilato-lucha-covid-19/compras.csv",
+    },
+    {
+        "id": "386038",
+        "nombre": "Productos uso médico lucha COVID-19",
+        "csv_url": "https://www.contrataciones.gov.py/convenios-marco/convenio/386038-adquisicion-productos-uso-medico-lucha-covid-19/compras.csv",
+    },
+    {
+        "id": "382392",
+        "nombre": "Productos contingencia COVID-19",
+        "csv_url": "https://www.contrataciones.gov.py/convenios-marco/convenio/382392-adquisicion-productos-contingencia-covid-19/compras.csv",
+    },
+]
 
 POSTGRES_DEFAULTS = {
     "host": os.environ.get("POSTGRES_HOST", "localhost"),
@@ -752,6 +781,82 @@ def _coerce_types(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def fetch_compras_csv_dncp(url: str) -> pd.DataFrame:
+    """Descarga el CSV de compras del convenio marco (DNCP)."""
+    req = urllib.request.Request(url, headers=DNCP_HTTP_HEADERS)
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        raw = resp.read()
+    for enc in ("utf-8-sig", "utf-8", "latin-1"):
+        for sep in (";", ","):
+            try:
+                df = pd.read_csv(
+                    BytesIO(raw),
+                    sep=sep,
+                    encoding=enc,
+                    on_bad_lines="skip",
+                    low_memory=False,
+                )
+                if len(df.columns) > 1:
+                    return df
+            except (UnicodeDecodeError, UnicodeError):
+                continue
+            except pd.errors.ParserError:
+                continue
+    return pd.read_csv(
+        BytesIO(raw),
+        sep=";",
+        encoding_errors="replace",
+        on_bad_lines="skip",
+        low_memory=False,
+    )
+
+
+def metricas_oc_y_proveedores_compras(df: pd.DataFrame) -> tuple[int, str]:
+    """Órdenes de compra distintas y texto resumido de proveedores."""
+    if df is None or df.empty:
+        return 0, "—"
+    col_oc = _pick(df, ("nro_orden_compra",))
+    if col_oc:
+        s = df[col_oc].astype(str).str.strip()
+        s = s[
+            (s != "")
+            & (~s.str.lower().isin(("nan", "none", "nat")))
+        ]
+        n_oc = int(s.nunique())
+    else:
+        n_oc = int(len(df.index))
+    col_pr = _pick(df, ("proveedor", "Proveedor"))
+    if not col_pr:
+        return n_oc, "—"
+    provs = df[col_pr].dropna().astype(str).str.strip()
+    provs = provs[(provs != "") & (~provs.str.lower().isin(("nan",)))]
+    uniq = sorted(provs.unique().tolist())
+    if not uniq:
+        return n_oc, "—"
+    if len(uniq) <= 2:
+        return n_oc, "; ".join(uniq)
+    return (
+        n_oc,
+        f"{len(uniq)} proveedores · {uniq[0]}; {uniq[1]}; …",
+    )
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def resumen_convenio_dncp_cached(csv_url: str) -> dict[str, object]:
+    """Datos agregados desde compras.csv (caché 30 min)."""
+    try:
+        df = fetch_compras_csv_dncp(csv_url)
+        n_oc, prov_txt = metricas_oc_y_proveedores_compras(df)
+        return {
+            "ok": True,
+            "n_oc": n_oc,
+            "proveedores": prov_txt,
+            "filas": len(df),
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:400]}
+
+
 def _aplicar_catalogo_stock_critico(d0: pd.DataFrame) -> pd.DataFrame:
     """LEFT JOIN con catalogo_stock_critico: si hay SICIAP, reemplaza n5 por descripcion_oficial."""
     if "n5" not in d0.columns or "codigo_siciap" not in d0.columns:
@@ -1393,45 +1498,66 @@ with tab_instr:
 
 with tab_enlaces:
     st.subheader("Convenios prioritarios (Nivel Central / COVID)")
-    datos_enlaces = [
-        {
-            "ID": "400275",
-            "Convenio": "Uso médico lucha COVID-19 Grupo 2",
-            "Enlace": "https://www.contrataciones.gov.py/convenios-marco/convenio/400275-adquisicion-productos-uso-medico-lucha-covid-19-grupo-2/compras.csv",
-        },
-        {
-            "ID": "395261",
-            "Convenio": "Midazolam y atracurio besilato",
-            "Enlace": "https://www.contrataciones.gov.py/convenios-marco/convenio/395261-adquisicion-midazolam-atracurio-besilato-lucha-covid-19/compras.csv",
-        },
-        {
-            "ID": "386038",
-            "Convenio": "Productos uso médico lucha COVID-19",
-            "Enlace": "https://www.contrataciones.gov.py/convenios-marco/convenio/386038-adquisicion-productos-uso-medico-lucha-covid-19/compras.csv",
-        },
-        {
-            "ID": "382392",
-            "Convenio": "Productos contingencia COVID-19",
-            "Enlace": "https://www.contrataciones.gov.py/convenios-marco/convenio/382392-adquisicion-productos-contingencia-covid-19/compras.csv",
-        },
-    ]
-    df_enlaces = pd.DataFrame(datos_enlaces)
+    st.caption(
+        "La tabla se arma **descargando en vivo** cada `compras.csv` del DNCP "
+        "(separador `;`). Las órdenes son **número distinto de `nro_orden_compra`**; "
+        "proveedores: resumen de empresas en ese CSV."
+    )
+    if st.button("🔄 Actualizar datos desde DNCP", key="dncp_refresh_enlaces"):
+        resumen_convenio_dncp_cached.clear()
+        st.rerun()
+
+    filas_enlaces: list[dict[str, object]] = []
+    with st.spinner("Consultando DNCP (cuatro convenios)…"):
+        for conv in DNCP_CONVENIOS_PRIORITARIOS:
+            res = resumen_convenio_dncp_cached(conv["csv_url"])
+            if res.get("ok"):
+                filas_enlaces.append(
+                    {
+                        "ID": conv["id"],
+                        "Nombre del convenio": conv["nombre"],
+                        "Órdenes de compra emitidas": int(res["n_oc"]),
+                        "Proveedor(es)": str(res["proveedores"]),
+                        "Link": conv["csv_url"],
+                    }
+                )
+            else:
+                filas_enlaces.append(
+                    {
+                        "ID": conv["id"],
+                        "Nombre del convenio": conv["nombre"],
+                        "Órdenes de compra emitidas": 0,
+                        "Proveedor(es)": f"⚠️ {res.get('error', 'Error al leer CSV')}",
+                        "Link": conv["csv_url"],
+                    }
+                )
+
+    df_enlaces = pd.DataFrame(filas_enlaces)
     st.dataframe(
         df_enlaces,
         column_config={
             "ID": st.column_config.TextColumn("ID", width="small"),
-            "Convenio": st.column_config.TextColumn(
-                "Nombre del Convenio", width="large"
+            "Nombre del convenio": st.column_config.TextColumn(
+                "Nombre del convenio", width="medium"
             ),
-            "Enlace": st.column_config.LinkColumn(
-                "Acción", display_text="📥 Descargar CSV"
+            "Órdenes de compra emitidas": st.column_config.NumberColumn(
+                "Órdenes OC emitidas",
+                format="%d",
+            ),
+            "Proveedor(es)": st.column_config.TextColumn(
+                "Proveedor(es)", width="large"
+            ),
+            "Link": st.column_config.LinkColumn(
+                "Descargar CSV DNCP", display_text="📥 CSV compras"
             ),
         },
         hide_index=True,
         width="stretch",
     )
     st.caption(
-        "Otros convenios o enlaces internos del equipo podés sumarlos aquí cuando amplíes la lista."
+        "**Ficha web del convenio:** quitá `/compras.csv` del mismo enlace o abrilo desde el portal DNCP. "
+        "Para sumar más convenios, editá `DNCP_CONVENIOS_PRIORITARIOS` en `app.py`. "
+        "Caché ~30 min o **Actualizar desde DNCP**."
     )
 
 with tab_carga:
