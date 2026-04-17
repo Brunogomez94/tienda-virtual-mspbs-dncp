@@ -28,6 +28,7 @@ DEFAULT_TABLE = os.environ.get("TV_TABLE", "contrataciones_datos")
 # Tabla de logística (OC + producto); no altera la tabla principal de la fuente.
 COMPLEMENTARIOS_TABLE = "datos_complementarios_oc"
 AGENDAMIENTOS_TABLE = "agendamientos_entregas"
+CATALOGO_STOCK_TABLE = "catalogo_stock_critico"
 
 POSTGRES_DEFAULTS = {
     "host": os.environ.get("POSTGRES_HOST", "localhost"),
@@ -230,6 +231,7 @@ def inicializar_base_de_datos(engine: "Engine") -> None:
     """Crea las tablas necesarias si no existen (logística + agendamientos parciales)."""
     _validate_sql_identifier(COMPLEMENTARIOS_TABLE)
     _validate_sql_identifier(AGENDAMIENTOS_TABLE)
+    _validate_sql_identifier(CATALOGO_STOCK_TABLE)
     sql_complementaria = text(
         f"""
         CREATE TABLE IF NOT EXISTS public.{COMPLEMENTARIOS_TABLE} (
@@ -258,9 +260,18 @@ def inicializar_base_de_datos(engine: "Engine") -> None:
         );
         """
     )
+    sql_catalogo = text(
+        f"""
+        CREATE TABLE IF NOT EXISTS public.{CATALOGO_STOCK_TABLE} (
+            codigo_siciap VARCHAR(100) NOT NULL PRIMARY KEY,
+            descripcion_oficial TEXT NOT NULL
+        );
+        """
+    )
     with engine.begin() as conn:
         conn.execute(sql_complementaria)
         conn.execute(sql_agendamientos)
+        conn.execute(sql_catalogo)
 
 
 def _validate_sql_identifier(name: str) -> str:
@@ -565,6 +576,48 @@ def _coerce_types(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _aplicar_catalogo_stock_critico(d0: pd.DataFrame) -> pd.DataFrame:
+    """LEFT JOIN con catalogo_stock_critico: si hay SICIAP, reemplaza n5 por descripcion_oficial."""
+    if "n5" not in d0.columns or "codigo_siciap" not in d0.columns:
+        return d0
+    try:
+        engine = get_engine()
+    except Exception:
+        return d0
+    if not table_exists(engine, CATALOGO_STOCK_TABLE):
+        return d0
+    try:
+        with engine.connect() as conn:
+            cat = pd.read_sql(
+                text(
+                    f"SELECT codigo_siciap, descripcion_oficial FROM public.{CATALOGO_STOCK_TABLE}"
+                ),
+                conn,
+            )
+    except Exception:
+        return d0
+    if cat.empty or "descripcion_oficial" not in cat.columns:
+        return d0
+    out = d0.copy()
+    out["_sic_join"] = out["codigo_siciap"].astype(str).str.strip()
+    cat = cat.copy()
+    cat["_sic_join"] = cat["codigo_siciap"].astype(str).str.strip()
+    cat = cat.drop_duplicates(subset=["_sic_join"], keep="last")
+    merged = out.merge(
+        cat[["_sic_join", "descripcion_oficial"]],
+        on="_sic_join",
+        how="left",
+    )
+    merged = merged.drop(columns=["_sic_join"], errors="ignore")
+    mask = (
+        merged["descripcion_oficial"].notna()
+        & merged["descripcion_oficial"].astype(str).str.strip().ne("")
+        & merged["codigo_siciap"].astype(str).str.strip().ne("")
+    )
+    merged.loc[mask, "n5"] = merged.loc[mask, "descripcion_oficial"].astype(str).str.strip()
+    return merged.drop(columns=["descripcion_oficial"], errors="ignore")
+
+
 def render_tablero(
     df: pd.DataFrame,
     *,
@@ -586,6 +639,8 @@ def render_tablero(
         d0["codigo_siciap"] = ""
     if "lugar_entrega" not in d0.columns:
         d0["lugar_entrega"] = ""
+
+    d0 = _aplicar_catalogo_stock_critico(d0)
 
     col_monto = _pick(d0, ("precio_total", "monto"))
     col_prov = _pick(d0, ("proveedor",))
@@ -856,8 +911,27 @@ def render_tablero(
                     cant_txt = str(cant_raw)
 
                 with st.container():
+                    prov_txt = str(row.get("proveedor", "") or "").strip() or "N/A"
+                    fc_val = (
+                        row.get(col_fecha)
+                        if col_fecha and col_fecha in row
+                        else row.get("fecha_orden_compra")
+                    )
+                    if pd.isna(fc_val) or fc_val is None:
+                        fecha_txt = "N/A"
+                    elif hasattr(fc_val, "strftime"):
+                        try:
+                            fecha_txt = fc_val.strftime("%d/%m/%Y %H:%M")
+                        except Exception:
+                            fecha_txt = str(fc_val)
+                    else:
+                        fecha_txt = str(fc_val)
+
                     st.markdown(f"**Ítem:** {descripcion}")
-                    st.caption(f"Cantidad emitida: {cant_txt}")
+                    st.caption(
+                        f"**Proveedor:** {prov_txt} | **Fecha emisión:** {fecha_txt} | "
+                        f"**Cantidad emitida:** {cant_txt}"
+                    )
 
                     row_key = f"{k('form')}_{orden_key}_{form_i}"
                     c1, c2, c3 = st.columns(3)
@@ -1125,14 +1199,16 @@ if not check_password():
     )
     st.stop()
 
-tab_instr, tab_app = st.tabs(["📋 Instructivo de uso", "🛒 Aplicación"])
+tab_instr, tab_enlaces, tab_app = st.tabs(
+    ["📋 Instructivo", "🔗 Enlaces DNCP", "🛒 Aplicación"]
+)
 
 with tab_instr:
     st.subheader("Instructivo de uso")
     st.markdown(
         """
-1. Descargar el archivo CSV de la DNCP desde:  
-   [https://www.contrataciones.gov.py/t/download/SieDocumento/10](https://www.contrataciones.gov.py/t/download/SieDocumento/10)
+1. Descargar datos: pestaña **Enlaces DNCP** (convenios prioritarios) o el enlace general:  
+   [Descarga CSV DNCP](https://www.contrataciones.gov.py/t/download/SieDocumento/10)
 
 2. Ir a la pestaña **Aplicación** → sección **Archivo CSV** en esta app y subir el archivo descargado.
 
@@ -1141,6 +1217,25 @@ with tab_instr:
 4. Para gestionar la logística: pestaña **Aplicación** → **Base de Datos (Supabase)** → **Ver Reporte (MSPBS - UOC)**.
 
 5. En cada ítem podés abrir **Agendamiento de Entregas Parciales** para planificar entregas y, al recibir el camión, **Confirmar recepción** (actualiza automáticamente la cantidad entregada en la base).
+
+6. **Catálogo Stock Crítico** (sidebar): subí un CSV con `codigo_siciap` y `descripcion_oficial` para que la tabla muestre la descripción oficial cuando el ítem tenga ese código cargado.
+        """
+    )
+
+with tab_enlaces:
+    st.subheader("Enlaces DNCP")
+    st.markdown(
+        """
+### Convenios prioritarios (Nivel Central / COVID)
+
+* [ID 400275 — Uso médico lucha COVID-19 Grupo 2](https://www.contrataciones.gov.py/convenios-marco/convenio/400275-adquisicion-productos-uso-medico-lucha-covid-19-grupo-2/compras.csv)
+* [ID 395261 — Midazolam y atracurio besilato](https://www.contrataciones.gov.py/convenios-marco/convenio/395261-adquisicion-midazolam-atracurio-besilato-lucha-covid-19/compras.csv)
+* [ID 386038 — Productos uso médico lucha COVID-19](https://www.contrataciones.gov.py/convenios-marco/convenio/386038-adquisicion-productos-uso-medico-lucha-covid-19/compras.csv)
+* [ID 382392 — Productos contingencia COVID-19](https://www.contrataciones.gov.py/convenios-marco/convenio/382392-adquisicion-productos-contingencia-covid-19/compras.csv)
+
+### Otros convenios
+
+Acá podés sumar enlaces internos del equipo (portal interno, carpetas compartidas, etc.) según las necesidades operativas.
         """
     )
 
@@ -1156,6 +1251,53 @@ with tab_app:
     )
 
     st.sidebar.markdown("---")
+
+    with st.sidebar.expander("⚙️ Cargar catálogo Stock Crítico", expanded=False):
+        st.caption(
+            "CSV con columnas **codigo_siciap** y **descripcion_oficial** "
+            "(desde Excel: *Guardar como CSV*)."
+        )
+        cat_up = st.file_uploader("Archivo catálogo", type=["csv"], key="catalogo_stock_upload")
+        if st.button("Guardar catálogo en la nube", key="catalogo_stock_btn"):
+            if cat_up is None:
+                st.error("Seleccioná un archivo CSV.")
+            else:
+                try:
+                    raw = pd.read_csv(cat_up, dtype=str, encoding="utf-8", on_bad_lines="skip")
+                    df_cat = raw.copy()
+                    df_cat.columns = (
+                        df_cat.columns.str.strip().str.lower().str.replace(" ", "_", regex=False)
+                    )
+                    for req in ("codigo_siciap", "descripcion_oficial"):
+                        if req not in df_cat.columns:
+                            raise ValueError(
+                                f"El CSV debe incluir las columnas codigo_siciap y descripcion_oficial (falta: {req})."
+                            )
+                    df_out = df_cat[["codigo_siciap", "descripcion_oficial"]].copy()
+                    df_out["codigo_siciap"] = df_out["codigo_siciap"].astype(str).str.strip()
+                    df_out["descripcion_oficial"] = (
+                        df_out["descripcion_oficial"].astype(str).str.strip()
+                    )
+                    df_out = df_out[df_out["codigo_siciap"] != ""]
+                    if df_out.empty:
+                        raise ValueError("No quedaron filas con código SICIAP no vacío.")
+                    eng = get_engine()
+                    with eng.begin() as conn:
+                        df_out.to_sql(
+                            CATALOGO_STOCK_TABLE,
+                            con=conn,
+                            schema="public",
+                            if_exists="replace",
+                            index=False,
+                            chunksize=500,
+                            method="multi",
+                        )
+                    st.success(f"Catálogo actualizado en la nube: **{len(df_out):,}** ítems.")
+                    st.rerun()
+                except UnicodeDecodeError:
+                    st.error("No se pudo leer el CSV como UTF-8. Guardalo en UTF-8 e intentá de nuevo.")
+                except Exception as e:
+                    st.error(str(e))
 
     # Nombre de tabla fijo por código / variable de entorno TV_TABLE (sin campo en la UI)
     tabla_pg = os.environ.get("TV_TABLE", DEFAULT_TABLE)
