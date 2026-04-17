@@ -687,6 +687,50 @@ def refrescar_datos_tablero_en_sesion(engine: "Engine") -> None:
         )
 
 
+def cargar_catalogo_siciap(engine: "Engine", df_catalogo: pd.DataFrame) -> None:
+    """Guarda el catálogo en Supabase reemplazando el anterior."""
+    df = df_catalogo.rename(columns=lambda x: str(x).strip().lower())
+    if "codigo_siciap" not in df.columns or "descripcion_oficial" not in df.columns:
+        raise ValueError(
+            "El archivo debe contener las columnas 'codigo_siciap' y 'descripcion_oficial'."
+        )
+    df = df[["codigo_siciap", "descripcion_oficial"]].copy()
+    df["codigo_siciap"] = df["codigo_siciap"].astype(str).str.strip()
+    df["descripcion_oficial"] = df["descripcion_oficial"].astype(str).str.strip()
+    df = df[df["codigo_siciap"].ne("")]
+    df = df[df["descripcion_oficial"].ne("")]
+    df = df.drop_duplicates(subset=["codigo_siciap"], keep="last")
+    if df.empty:
+        raise ValueError("No quedaron filas válidas tras limpiar el catálogo.")
+    with engine.begin() as conn:
+        df.to_sql(
+            CATALOGO_STOCK_TABLE,
+            con=conn,
+            schema="public",
+            if_exists="replace",
+            index=False,
+            chunksize=500,
+            method="multi",
+        )
+
+
+def leer_catalogo_siciap(engine: "Engine") -> Optional[pd.DataFrame]:
+    """Lee el catálogo desde la base de datos. Retorna None si no existe o está vacío."""
+    if not table_exists(engine, CATALOGO_STOCK_TABLE):
+        return None
+    try:
+        df = pd.read_sql_table(CATALOGO_STOCK_TABLE, con=engine, schema="public")
+    except Exception:
+        return None
+    if df.empty:
+        return None
+    if "codigo_siciap" not in df.columns or "descripcion_oficial" not in df.columns:
+        return None
+    df = df.copy()
+    df["codigo_siciap"] = df["codigo_siciap"].astype(str).str.strip()
+    return df
+
+
 # ==========================================
 # 4. DASHBOARD
 # ==========================================
@@ -716,19 +760,8 @@ def _aplicar_catalogo_stock_critico(d0: pd.DataFrame) -> pd.DataFrame:
         engine = get_engine()
     except Exception:
         return d0
-    if not table_exists(engine, CATALOGO_STOCK_TABLE):
-        return d0
-    try:
-        with engine.connect() as conn:
-            cat = pd.read_sql(
-                text(
-                    f"SELECT codigo_siciap, descripcion_oficial FROM public.{CATALOGO_STOCK_TABLE}"
-                ),
-                conn,
-            )
-    except Exception:
-        return d0
-    if cat.empty or "descripcion_oficial" not in cat.columns:
+    cat = leer_catalogo_siciap(engine)
+    if cat is None or cat.empty:
         return d0
     out = d0.copy()
     out["_sic_join"] = out["codigo_siciap"].astype(str).str.strip()
@@ -1479,39 +1512,29 @@ with tab_app:
         with st.sidebar.expander(
             "⚙️ Cargar catálogo Stock Crítico (Solo Local)", expanded=False
         ):
-            st.caption(
-                "Archivo **.xlsx** (Stock Crítico DMP/MSPBS) o **CSV** con columnas "
+            st.info(
+                "Subí un CSV o Excel DMP/MSPBS: se normalizan columnas a "
                 "**codigo_siciap** y **descripcion_oficial**."
             )
-            cat_up = st.file_uploader(
-                "Archivo catálogo",
+            archivo_catalogo = st.file_uploader(
+                "Archivo de Catálogo SICIAP",
                 type=["csv", "xlsx"],
                 key="catalogo_stock_upload",
             )
-            if st.button("Guardar catálogo en la nube", key="catalogo_stock_btn"):
-                if cat_up is None:
+            if st.button(
+                "Actualizar Catálogo en Base de Datos",
+                key="catalogo_stock_btn",
+            ):
+                if archivo_catalogo is None:
                     st.error("Seleccioná un archivo (.csv o .xlsx).")
                 else:
                     try:
-                        cat_up.seek(0)
-                        df_out = preparar_dataframe_catalogo_stock(cat_up)
-                        if df_out.empty:
-                            raise ValueError(
-                                "No quedaron filas válidas (código y descripción no vacíos)."
-                            )
+                        archivo_catalogo.seek(0)
+                        df_out = preparar_dataframe_catalogo_stock(archivo_catalogo)
                         eng = get_engine()
-                        with eng.begin() as conn:
-                            df_out.to_sql(
-                                CATALOGO_STOCK_TABLE,
-                                con=conn,
-                                schema="public",
-                                if_exists="replace",
-                                index=False,
-                                chunksize=500,
-                                method="multi",
-                            )
+                        cargar_catalogo_siciap(eng, df_out)
                         st.success(
-                            f"Catálogo actualizado en la nube: **{len(df_out):,}** ítems."
+                            f"Catálogo SICIAP actualizado: **{len(df_out):,}** ítems en la nube."
                         )
                         st.rerun()
                     except UnicodeDecodeError:
@@ -1519,7 +1542,7 @@ with tab_app:
                             "No se pudo leer el CSV como UTF-8. Guardalo en UTF-8 e intentá de nuevo."
                         )
                     except Exception as e:
-                        st.error(str(e))
+                        st.error(f"Error al procesar el archivo: {e}")
 
     # Nombre de tabla fijo por código / variable de entorno TV_TABLE (sin campo en la UI)
     tabla_pg = os.environ.get("TV_TABLE", DEFAULT_TABLE)
