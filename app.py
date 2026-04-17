@@ -899,7 +899,8 @@ def render_tablero(
             .configure_view(strokeWidth=0)
         )
 
-        st.altair_chart(chart, width="stretch")
+        # `altair_chart` no admite `width=` en todas las versiones; `use_container_width` sigue siendo válido aquí.
+        st.altair_chart(chart, use_container_width=True)
 
     st.markdown("#### Tabla")
     work = d.copy()
