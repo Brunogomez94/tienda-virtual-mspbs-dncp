@@ -9,7 +9,7 @@ import os
 import re
 import tempfile
 from urllib.parse import quote_plus
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, Optional
 
@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 DEFAULT_TABLE = os.environ.get("TV_TABLE", "contrataciones_datos")
 # Tabla de logística (OC + producto); no altera la tabla principal de la fuente.
 COMPLEMENTARIOS_TABLE = "datos_complementarios_oc"
+AGENDAMIENTOS_TABLE = "agendamientos_entregas"
 
 POSTGRES_DEFAULTS = {
     "host": os.environ.get("POSTGRES_HOST", "localhost"),
@@ -226,8 +227,9 @@ def get_engine() -> "Engine":
 
 
 def inicializar_base_de_datos(engine: "Engine") -> None:
-    """Crea las tablas necesarias si no existen (p. ej. logística complementaria en Supabase)."""
+    """Crea las tablas necesarias si no existen (logística + agendamientos parciales)."""
     _validate_sql_identifier(COMPLEMENTARIOS_TABLE)
+    _validate_sql_identifier(AGENDAMIENTOS_TABLE)
     sql_complementaria = text(
         f"""
         CREATE TABLE IF NOT EXISTS public.{COMPLEMENTARIOS_TABLE} (
@@ -241,8 +243,24 @@ def inicializar_base_de_datos(engine: "Engine") -> None:
         );
         """
     )
+    sql_agendamientos = text(
+        f"""
+        CREATE TABLE IF NOT EXISTS public.{AGENDAMIENTOS_TABLE} (
+            id SERIAL PRIMARY KEY,
+            nro_orden_compra VARCHAR(255) NOT NULL,
+            descripcion_producto TEXT NOT NULL,
+            fecha_agendada DATE NOT NULL,
+            cantidad_agendada NUMERIC NOT NULL,
+            cantidad_pallets NUMERIC,
+            lugar_entrega VARCHAR(255),
+            estado VARCHAR(50) DEFAULT 'Pendiente',
+            fecha_creacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    )
     with engine.begin() as conn:
         conn.execute(sql_complementaria)
+        conn.execute(sql_agendamientos)
 
 
 def _validate_sql_identifier(name: str) -> str:
@@ -352,6 +370,138 @@ def table_exists(engine: "Engine", table: str, schema: str = "public") -> bool:
     return row is not None
 
 
+def obtener_agendamientos(
+    engine: "Engine", nro_oc: str, descripcion_producto: str
+) -> pd.DataFrame:
+    """Historial de agendamientos para una OC y descripción de producto."""
+    if not table_exists(engine, AGENDAMIENTOS_TABLE):
+        return pd.DataFrame(
+            columns=[
+                "id",
+                "fecha_agendada",
+                "cantidad_agendada",
+                "cantidad_pallets",
+                "lugar_entrega",
+                "estado",
+                "fecha_creacion",
+            ]
+        )
+    sql = text(
+        f"""
+        SELECT id, fecha_agendada, cantidad_agendada, cantidad_pallets,
+               lugar_entrega, estado, fecha_creacion
+        FROM public.{AGENDAMIENTOS_TABLE}
+        WHERE nro_orden_compra = :oc AND descripcion_producto = :dp
+        ORDER BY fecha_creacion DESC
+        """
+    )
+    with engine.connect() as conn:
+        return pd.read_sql(sql, conn, params={"oc": str(nro_oc), "dp": str(descripcion_producto)})
+
+
+def guardar_agendamiento(
+    engine: "Engine",
+    nro_oc: str,
+    descripcion_producto: str,
+    fecha_agendada: date,
+    cantidad_agendada: float,
+    cantidad_pallets: Optional[float],
+    lugar_entrega: str,
+) -> None:
+    """Inserta un agendamiento pendiente."""
+    _validate_sql_identifier(AGENDAMIENTOS_TABLE)
+    pallets_val = float(cantidad_pallets) if cantidad_pallets is not None else None
+    ins = text(
+        f"""
+        INSERT INTO public.{AGENDAMIENTOS_TABLE} (
+            nro_orden_compra, descripcion_producto, fecha_agendada,
+            cantidad_agendada, cantidad_pallets, lugar_entrega, estado
+        ) VALUES (
+            :oc, :dp, :fecha, :cant, :pallets, :lugar, 'Pendiente'
+        )
+        """
+    )
+    with engine.begin() as conn:
+        conn.execute(
+            ins,
+            {
+                "oc": str(nro_oc),
+                "dp": str(descripcion_producto),
+                "fecha": fecha_agendada,
+                "cant": float(cantidad_agendada),
+                "pallets": pallets_val,
+                "lugar": (lugar_entrega or "")[:255],
+            },
+        )
+
+
+def confirmar_recepcion_agendamiento(engine: "Engine", agendamiento_id: int) -> None:
+    """
+    Marca el agendamiento como Entregado y suma cantidad_agendada a datos_complementarios_oc
+    en una sola transacción.
+    """
+    _validate_sql_identifier(AGENDAMIENTOS_TABLE)
+    _validate_sql_identifier(COMPLEMENTARIOS_TABLE)
+    tbl_c = COMPLEMENTARIOS_TABLE
+    upsert_comp = text(
+        f"""
+        INSERT INTO public.{tbl_c} (
+            nro_orden_compra, descripcion_producto, codigo_siciap, lugar_entrega, cantidad_entregada
+        ) VALUES (:oc, :dp, '', '', :delta)
+        ON CONFLICT (nro_orden_compra, descripcion_producto) DO UPDATE SET
+            cantidad_entregada = COALESCE(
+                datos_complementarios_oc.cantidad_entregada, 0
+            ) + EXCLUDED.cantidad_entregada,
+            ultima_actualizacion = CURRENT_TIMESTAMP
+        """
+    )
+    with engine.begin() as conn:
+        row = (
+            conn.execute(
+                text(
+                    f"""
+                    SELECT nro_orden_compra, descripcion_producto, cantidad_agendada, estado
+                    FROM public.{AGENDAMIENTOS_TABLE}
+                    WHERE id = :id
+                    FOR UPDATE
+                    """
+                ),
+                {"id": agendamiento_id},
+            )
+            .mappings()
+            .first()
+        )
+        if row is None:
+            raise ValueError("Agendamiento no encontrado.")
+        if str(row["estado"]).strip() != "Pendiente":
+            raise ValueError("Solo se puede confirmar un agendamiento en estado Pendiente.")
+        delta = float(row["cantidad_agendada"])
+        oc = str(row["nro_orden_compra"])
+        dp = str(row["descripcion_producto"])
+        conn.execute(
+            text(
+                f"UPDATE public.{AGENDAMIENTOS_TABLE} SET estado = 'Entregado' WHERE id = :id"
+            ),
+            {"id": agendamiento_id},
+        )
+        conn.execute(upsert_comp, {"oc": oc, "dp": dp, "delta": delta})
+
+
+def actualizar_estado_agendamiento(
+    engine: "Engine", agendamiento_id: int, nuevo_estado: str
+) -> None:
+    """Actualiza estado; si pasa a Entregado, sincroniza cantidad entregada en datos_complementarios_oc."""
+    if nuevo_estado.strip() == "Entregado":
+        confirmar_recepcion_agendamiento(engine, agendamiento_id)
+        return
+    _validate_sql_identifier(AGENDAMIENTOS_TABLE)
+    with engine.begin() as conn:
+        conn.execute(
+            text(f"UPDATE public.{AGENDAMIENTOS_TABLE} SET estado = :e WHERE id = :id"),
+            {"e": nuevo_estado[:50], "id": agendamiento_id},
+        )
+
+
 def get_uoc_central_data(engine: "Engine") -> pd.DataFrame:
     """Consulta filtrada MSPBS – UOC Nivel Central (D.O.C) y convenios COVID indicados."""
     query = text(
@@ -381,6 +531,17 @@ def get_uoc_central_data(engine: "Engine") -> pd.DataFrame:
         df_principal = pd.read_sql(query, conn)
     df_comp = _read_datos_complementarios(engine)
     return merge_con_datos_complementarios(df_principal, df_comp)
+
+
+def refrescar_datos_tablero_en_sesion(engine: "Engine") -> None:
+    """Recarga el DataFrame activo en session_state tras cambios en la BD."""
+    active = st.session_state.get("ss_pg_active")
+    if active == "uoc":
+        st.session_state["ss_df_uoc"] = get_uoc_central_data(engine)
+    elif active == "pg_full":
+        st.session_state["ss_df_pg_full"] = obtener_datos_completos(
+            engine, os.environ.get("TV_TABLE", DEFAULT_TABLE)
+        )
 
 
 # ==========================================
@@ -675,15 +836,23 @@ def render_tablero(
 
             orden_key = re.sub(r"[^\w]", "_", oc_str)[:60]
 
+            engine_ag = None
+            if persist_complementarios_db:
+                try:
+                    engine_ag = get_engine()
+                except Exception:
+                    engine_ag = None
+
             for form_i, (_, row) in enumerate(d_edit.iterrows()):
-                descripcion = row.get("n5", "Sin descripción")
-                if pd.isna(descripcion):
-                    descripcion = "Sin descripción"
+                raw_n5 = row.get("n5")
+                desc_db = "" if pd.isna(raw_n5) else str(raw_n5).strip()
+                descripcion = desc_db if desc_db else "Sin descripción"
                 cant_raw = row.get("cantidad", 0)
                 try:
                     cant_num = float(cant_raw)
                     cant_txt = f"{cant_num:,.0f}".replace(",", ".")
                 except (TypeError, ValueError):
+                    cant_num = 0.0
                     cant_txt = str(cant_raw)
 
                 with st.container():
@@ -717,6 +886,131 @@ def render_tablero(
                             step=1.0,
                             key=f"{row_key}_cant_ent",
                         )
+
+                    with st.expander("📅 Agendamiento de Entregas Parciales", expanded=False):
+                        if not engine_ag:
+                            st.caption(
+                                "Los agendamientos solo están disponibles cuando trabajás "
+                                "con datos desde **Base de Datos (Supabase)**."
+                            )
+                        else:
+                            emitida_f = float(cant_num)
+                            df_ag = obtener_agendamientos(engine_ag, oc_str, desc_db)
+                            total_agendado = (
+                                float(df_ag["cantidad_agendada"].sum())
+                                if not df_ag.empty and "cantidad_agendada" in df_ag.columns
+                                else 0.0
+                            )
+                            try:
+                                ent_bd = float(row.get("cantidad_entregada", 0) or 0)
+                            except (TypeError, ValueError):
+                                ent_bd = 0.0
+                            saldo_agendar = max(0.0, emitida_f - total_agendado)
+                            m1, m2, m3 = st.columns(3)
+                            with m1:
+                                st.metric("Cantidad emitida (ítem)", f"{emitida_f:,.0f}".replace(",", "."))
+                            with m2:
+                                st.metric(
+                                    "Ya agendado (suma entregas planificadas)",
+                                    f"{total_agendado:,.0f}".replace(",", "."),
+                                )
+                            with m3:
+                                st.metric(
+                                    "Saldo pendiente de agendar",
+                                    f"{saldo_agendar:,.0f}".replace(",", "."),
+                                )
+                            st.caption(
+                                f"Cantidad entregada acumulada en BD (complementarios / recepciones): "
+                                f"{ent_bd:,.0f}".replace(",", ".")
+                            )
+
+                            col_ag1, col_ag2 = st.columns(2)
+                            with col_ag1:
+                                st.markdown("**Nueva entrega**")
+                                ag_fecha = st.date_input(
+                                    "Fecha agendada",
+                                    value=date.today(),
+                                    key=k(f"ag_fecha_{orden_key}_{form_i}"),
+                                )
+                                ag_cant = st.number_input(
+                                    "Cantidad agendada",
+                                    min_value=0.0,
+                                    value=min(1000.0, saldo_agendar) if saldo_agendar > 0 else 0.0,
+                                    step=1000.0,
+                                    key=k(f"ag_cant_{orden_key}_{form_i}"),
+                                )
+                                ag_pallets = st.number_input(
+                                    "Cantidad de pallets (opcional)",
+                                    min_value=0.0,
+                                    value=0.0,
+                                    step=1.0,
+                                    key=k(f"ag_pal_{orden_key}_{form_i}"),
+                                )
+                                ag_lugar = st.text_input(
+                                    "Lugar de entrega (agendamiento)",
+                                    value=str(row.get("lugar_entrega") or ""),
+                                    key=k(f"ag_lugar_{orden_key}_{form_i}"),
+                                )
+                                if st.button(
+                                    "Agendar entrega",
+                                    key=k(f"ag_btn_{orden_key}_{form_i}"),
+                                ):
+                                    try:
+                                        if ag_cant <= 0:
+                                            st.error("La cantidad agendada debe ser mayor a cero.")
+                                        elif total_agendado + ag_cant > emitida_f + 1e-9:
+                                            st.error(
+                                                "La suma de agendamientos no puede superar la cantidad emitida."
+                                            )
+                                        else:
+                                            pallets_ins = (
+                                                float(ag_pallets) if ag_pallets > 0 else None
+                                            )
+                                            guardar_agendamiento(
+                                                engine_ag,
+                                                oc_str,
+                                                desc_db,
+                                                ag_fecha,
+                                                float(ag_cant),
+                                                pallets_ins,
+                                                ag_lugar.strip(),
+                                            )
+                                            st.success("Agendamiento registrado.")
+                                            refrescar_datos_tablero_en_sesion(engine_ag)
+                                            st.rerun()
+                                    except Exception as ex_ag:
+                                        st.error(str(ex_ag))
+
+                            with col_ag2:
+                                st.markdown("**Historial**")
+                                if df_ag.empty:
+                                    st.caption("Sin agendamientos para este ítem.")
+                                else:
+                                    show_ag = df_ag.copy()
+                                    st.dataframe(
+                                        show_ag,
+                                        width="stretch",
+                                        hide_index=True,
+                                        key=k(f"ag_tbl_{orden_key}_{form_i}"),
+                                    )
+                                    for _, ag in df_ag.iterrows():
+                                        aid = int(ag["id"])
+                                        est = str(ag.get("estado", "")).strip()
+                                        if est == "Pendiente":
+                                            if st.button(
+                                                "Confirmar recepción",
+                                                key=k(f"ag_cfm_{aid}_{form_i}"),
+                                            ):
+                                                try:
+                                                    actualizar_estado_agendamiento(
+                                                        engine_ag, aid, "Entregado"
+                                                    )
+                                                    st.success("Recepción confirmada.")
+                                                    refrescar_datos_tablero_en_sesion(engine_ag)
+                                                    st.rerun()
+                                                except Exception as ex_c:
+                                                    st.error(str(ex_c))
+
                     st.markdown("---")
 
             if persist_complementarios_db:
@@ -774,13 +1068,7 @@ def render_tablero(
                                 )
 
                         st.success(f"Avances guardados para la OC **{oc_str}**.")
-                        active = st.session_state.get("ss_pg_active")
-                        if active == "uoc":
-                            st.session_state["ss_df_uoc"] = get_uoc_central_data(engine)
-                        elif active == "pg_full":
-                            st.session_state["ss_df_pg_full"] = obtener_datos_completos(
-                                engine, os.environ.get("TV_TABLE", DEFAULT_TABLE)
-                            )
+                        refrescar_datos_tablero_en_sesion(engine)
                         st.rerun()
                     except Exception as e:
                         st.error(f"Error al guardar en la base de datos: {e}")
@@ -851,6 +1139,8 @@ with tab_instr:
 3. Hacer clic en **Cargar este DataFrame a la Base de Datos** (sobrescribe la tabla con los datos más recientes).
 
 4. Para gestionar la logística: pestaña **Aplicación** → **Base de Datos (Supabase)** → **Ver Reporte (MSPBS - UOC)**.
+
+5. En cada ítem podés abrir **Agendamiento de Entregas Parciales** para planificar entregas y, al recibir el camión, **Confirmar recepción** (actualiza automáticamente la cantidad entregada en la base).
         """
     )
 
