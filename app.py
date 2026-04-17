@@ -1293,11 +1293,19 @@ def render_tablero(
 def check_password() -> bool:
     """Retorna True si el usuario ingresó las credenciales correctas.
 
+    Roles: ``admin`` (carga CSV, catálogo stock) y ``operativo`` (solo tablero / BD).
+    Podés sobrescribir usuario y contraseña de admin con TV_ADMIN_USER y TV_ADMIN_PASSWORD.
+
     Nota: credenciales fijas son adecuadas solo para equipos cerrados; para mayor
     seguridad usá variables de entorno o un proveedor de identidad.
     """
+    admin_user = os.environ.get("TV_ADMIN_USER", "bruno_admin")
+    admin_pass = os.environ.get("TV_ADMIN_PASSWORD", "admin_dggies_2026")
+
     if "authenticated" not in st.session_state:
         st.session_state["authenticated"] = False
+    if "role" not in st.session_state:
+        st.session_state["role"] = None
 
     if st.session_state["authenticated"]:
         return True
@@ -1307,8 +1315,13 @@ def check_password() -> bool:
     password = st.sidebar.text_input("Contraseña", type="password", key="auth_pass")
 
     if st.sidebar.button("Entrar", key="auth_btn"):
-        if user == "stock_dggies" and password == "stock_dggiesmspbs":
+        if user == admin_user and password == admin_pass:
             st.session_state["authenticated"] = True
+            st.session_state["role"] = "admin"
+            st.rerun()
+        elif user == "stock_dggies" and password == "stock_dggiesmspbs":
+            st.session_state["authenticated"] = True
+            st.session_state["role"] = "operativo"
             st.rerun()
         else:
             st.sidebar.error("Usuario o contraseña incorrectos")
@@ -1325,28 +1338,55 @@ if not check_password():
     )
     st.stop()
 
-tab_instr, tab_enlaces, tab_app = st.tabs(
-    ["📋 Instructivo", "🔗 Enlaces DNCP", "🛒 Aplicación"]
-)
+# Sesiones antiguas sin rol: tratar como operativo (sin funciones de admin).
+if st.session_state.get("authenticated") and st.session_state.get("role") is None:
+    st.session_state["role"] = "operativo"
+
+IS_ADMIN = st.session_state.get("role") == "admin"
+
+if IS_ADMIN:
+    tab_admin, tab_instr, tab_enlaces, tab_app = st.tabs(
+        [
+            "⚙️ Admin (Carga CSV)",
+            "📋 Instructivo",
+            "🔗 Enlaces DNCP",
+            "🛒 Aplicación",
+        ]
+    )
+else:
+    tab_instr, tab_enlaces, tab_app = st.tabs(
+        ["📋 Instructivo", "🔗 Enlaces DNCP", "🛒 Aplicación"]
+    )
 
 with tab_instr:
     st.subheader("Instructivo de uso")
-    st.markdown(
-        """
+    if IS_ADMIN:
+        st.markdown(
+            """
 1. Descargar datos: pestaña **Enlaces DNCP** (convenios prioritarios) o el enlace general:  
    [Descarga CSV DNCP](https://www.contrataciones.gov.py/t/download/SieDocumento/10)
 
-2. Ir a la pestaña **Aplicación** → sección **Archivo CSV** en esta app y subir el archivo descargado.
+2. Ir a la pestaña **Admin (Carga CSV)**, subir el archivo descargado y, si corresponde, usar **Cargar este DataFrame a la Base de Datos** (sobrescribe la tabla en la nube con los datos del CSV actual).
 
-3. Hacer clic en **Cargar este DataFrame a la Base de Datos** (sobrescribe la tabla con los datos más recientes).
+3. Para gestionar la logística: pestaña **Aplicación** → panel lateral **Ver Reporte (MSPBS - UOC)** o **Leer tabla completa**.
 
-4. Para gestionar la logística: pestaña **Aplicación** → **Base de Datos (Supabase)** → **Ver Reporte (MSPBS - UOC)**.
+4. En cada ítem podés abrir **Agendamiento de Entregas Parciales** y **Confirmar recepción** cuando corresponda.
 
-5. En cada ítem podés abrir **Agendamiento de Entregas Parciales** para planificar entregas y, al recibir el camión, **Confirmar recepción** (actualiza automáticamente la cantidad entregada en la base).
+5. **Catálogo Stock Crítico** (sidebar en **Aplicación**, solo admin): subí un **.xlsx** (DMP/MSPBS) o **CSV** con `codigo_siciap` y `descripcion_oficial` para enriquecer descripciones en el tablero.
+            """
+        )
+    else:
+        st.markdown(
+            """
+1. Enlaces útiles: pestaña **Enlaces DNCP** (convenios prioritarios) o la [descarga general CSV DNCP](https://www.contrataciones.gov.py/t/download/SieDocumento/10).
 
-6. **Catálogo Stock Crítico** (sidebar): subí un **.xlsx** (descarga DMP/MSPBS) o un **CSV** con `codigo_siciap` y `descripcion_oficial` para que la tabla muestre la descripción oficial cuando el ítem tenga ese código cargado.
-        """
-    )
+2. Para trabajar con los datos cargados en el sistema: pestaña **Aplicación** → panel lateral **Ver Reporte (MSPBS - UOC)** o **Leer tabla completa**.
+
+3. En cada ítem podés abrir **Agendamiento de Entregas Parciales** y **Confirmar recepción** cuando corresponda.
+
+La carga masiva de archivos CSV y el catálogo «Stock Crítico» las realiza el **administrador** del sistema (perfil separado).
+            """
+        )
 
 with tab_enlaces:
     st.subheader("Enlaces DNCP")
@@ -1365,69 +1405,27 @@ Acá podés sumar enlaces internos del equipo (portal interno, carpetas comparti
         """
     )
 
-with tab_app:
-    st.caption(
-        "Subí un CSV o conectate a la base de datos. El tablero resume montos y proveedores; "
-        "al seleccionar una fila podés cargar datos complementarios debajo."
-    )
-
-    FUENTE_BD = "Base de Datos (Supabase)"
-    fuente = st.sidebar.radio(
-        "Origen de datos", ("Archivo CSV", FUENTE_BD), horizontal=True
-    )
-
-    st.sidebar.markdown("---")
-
-    with st.sidebar.expander("⚙️ Cargar catálogo Stock Crítico", expanded=False):
+if IS_ADMIN:
+    with tab_admin:
         st.caption(
-            "Archivo **.xlsx** (Stock Crítico DMP/MSPBS) o **CSV** con columnas "
-            "**codigo_siciap** y **descripcion_oficial**."
+            "Solo administración: vista previa del CSV y envío a Supabase "
+            "(reemplaza la tabla configurada en `TV_TABLE`)."
         )
-        cat_up = st.file_uploader(
-            "Archivo catálogo", type=["csv", "xlsx"], key="catalogo_stock_upload"
-        )
-        if st.button("Guardar catálogo en la nube", key="catalogo_stock_btn"):
-            if cat_up is None:
-                st.error("Seleccioná un archivo (.csv o .xlsx).")
-            else:
-                try:
-                    cat_up.seek(0)
-                    df_out = preparar_dataframe_catalogo_stock(cat_up)
-                    if df_out.empty:
-                        raise ValueError(
-                            "No quedaron filas válidas (código y descripción no vacíos)."
-                        )
-                    eng = get_engine()
-                    with eng.begin() as conn:
-                        df_out.to_sql(
-                            CATALOGO_STOCK_TABLE,
-                            con=conn,
-                            schema="public",
-                            if_exists="replace",
-                            index=False,
-                            chunksize=500,
-                            method="multi",
-                        )
-                    st.success(f"Catálogo actualizado en la nube: **{len(df_out):,}** ítems.")
-                    st.rerun()
-                except UnicodeDecodeError:
-                    st.error("No se pudo leer el CSV como UTF-8. Guardalo en UTF-8 e intentá de nuevo.")
-                except Exception as e:
-                    st.error(str(e))
+        tabla_pg = os.environ.get("TV_TABLE", DEFAULT_TABLE)
 
-    # Nombre de tabla fijo por código / variable de entorno TV_TABLE (sin campo en la UI)
-    tabla_pg = os.environ.get("TV_TABLE", DEFAULT_TABLE)
-
-    if fuente == "Archivo CSV":
         for _k in ("ss_df_uoc", "ss_df_pg_full", "ss_pg_active"):
             st.session_state.pop(_k, None)
 
         st.subheader("Cargar CSV")
         uploaded = st.file_uploader(
-            "Subir CSV (tienda órdenes, reporte compras, etc.)", type=["csv"]
+            "Subir CSV (tienda órdenes, reporte compras, etc.)",
+            type=["csv"],
+            key="admin_csv_upload",
         )
         ruta = st.text_input(
-            "O ruta absoluta a un .csv (solo útil en tu PC local)", value=""
+            "O ruta absoluta a un .csv (solo útil en tu PC local)",
+            value="",
+            key="admin_csv_path",
         )
 
         df: pd.DataFrame | None = None
@@ -1456,12 +1454,12 @@ with tab_app:
             st.info("Subí un archivo para visualizar los datos.")
         else:
             st.success(f"{len(df):,} filas × {len(df.columns)} columnas")
-            render_tablero(df, titulo="Vista desde archivo CSV", key_prefix="tv_csv")
+            render_tablero(df, titulo="Vista desde archivo CSV", key_prefix="tv_csv_admin")
 
             st.markdown("---")
             st.subheader("Enviar a la base de datos (Supabase)")
             st.caption("La carga **reemplaza** por completo la tabla con los datos del CSV actual.")
-            if st.button("Cargar este DataFrame a la Base de Datos"):
+            if st.button("Cargar este DataFrame a la Base de Datos", key="admin_btn_cargar_bd"):
                 try:
                     esperado, verificado = subir_a_postgresql(
                         df, tabla_pg, if_exists="replace"
@@ -1473,62 +1471,116 @@ with tab_app:
                 except Exception as e:
                     st.error(f"❌ Error en la carga o verificación: {e}")
 
-    else:
-        st.subheader("Lectura desde Base de Datos (Supabase)")
+with tab_app:
+    st.caption(
+        "Conectate a la base de datos para el tablero y la logística; "
+        "al seleccionar una fila podés cargar datos complementarios debajo."
+    )
 
-        st.sidebar.markdown("#### Consultas")
-        if st.sidebar.button("Ver Reporte (MSPBS - UOC)", key="btn_uoc_central"):
-            try:
-                engine = get_engine()
-                if not table_exists(engine, "contrataciones_datos"):
-                    st.warning("No existe la tabla `contrataciones_datos` en public.")
+    st.sidebar.markdown("---")
+
+    if IS_ADMIN:
+        with st.sidebar.expander("⚙️ Cargar catálogo Stock Crítico", expanded=False):
+            st.caption(
+                "Archivo **.xlsx** (Stock Crítico DMP/MSPBS) o **CSV** con columnas "
+                "**codigo_siciap** y **descripcion_oficial**."
+            )
+            cat_up = st.file_uploader(
+                "Archivo catálogo",
+                type=["csv", "xlsx"],
+                key="catalogo_stock_upload",
+            )
+            if st.button("Guardar catálogo en la nube", key="catalogo_stock_btn"):
+                if cat_up is None:
+                    st.error("Seleccioná un archivo (.csv o .xlsx).")
                 else:
-                    with st.spinner("Consultando datos del Nivel Central..."):
-                        df_uoc = get_uoc_central_data(engine)
-                    if df_uoc.empty:
-                        st.session_state.pop("ss_df_uoc", None)
-                        st.session_state.pop("ss_pg_active", None)
-                        st.warning(
-                            "No se encontraron registros con los filtros indicados."
+                    try:
+                        cat_up.seek(0)
+                        df_out = preparar_dataframe_catalogo_stock(cat_up)
+                        if df_out.empty:
+                            raise ValueError(
+                                "No quedaron filas válidas (código y descripción no vacíos)."
+                            )
+                        eng = get_engine()
+                        with eng.begin() as conn:
+                            df_out.to_sql(
+                                CATALOGO_STOCK_TABLE,
+                                con=conn,
+                                schema="public",
+                                if_exists="replace",
+                                index=False,
+                                chunksize=500,
+                                method="multi",
+                            )
+                        st.success(
+                            f"Catálogo actualizado en la nube: **{len(df_out):,}** ítems."
                         )
-                    else:
-                        st.session_state["ss_df_uoc"] = df_uoc
-                        st.session_state["ss_pg_active"] = "uoc"
-            except Exception as e:
-                st.error(f"Error en la conexión o consulta: {e}")
+                        st.rerun()
+                    except UnicodeDecodeError:
+                        st.error(
+                            "No se pudo leer el CSV como UTF-8. Guardalo en UTF-8 e intentá de nuevo."
+                        )
+                    except Exception as e:
+                        st.error(str(e))
 
-        st.sidebar.markdown("---")
+    # Nombre de tabla fijo por código / variable de entorno TV_TABLE (sin campo en la UI)
+    tabla_pg = os.environ.get("TV_TABLE", DEFAULT_TABLE)
 
-        if st.sidebar.button("Leer tabla completa", key="btn_lectura_tabla"):
-            try:
-                engine = get_engine()
-                if not table_exists(engine, tabla_pg):
-                    st.warning(f"No existe la tabla `{tabla_pg}` en public.")
+    st.subheader("Lectura desde Base de Datos (Supabase)")
+
+    st.sidebar.markdown("#### Consultas")
+    if st.sidebar.button("Ver Reporte (MSPBS - UOC)", key="btn_uoc_central"):
+        try:
+            engine = get_engine()
+            if not table_exists(engine, "contrataciones_datos"):
+                st.warning("No existe la tabla `contrataciones_datos` en public.")
+            else:
+                with st.spinner("Consultando datos del Nivel Central..."):
+                    df_uoc = get_uoc_central_data(engine)
+                if df_uoc.empty:
+                    st.session_state.pop("ss_df_uoc", None)
+                    st.session_state.pop("ss_pg_active", None)
+                    st.warning(
+                        "No se encontraron registros con los filtros indicados."
+                    )
                 else:
-                    with st.spinner("Cargando todos los registros..."):
-                        df_pg = obtener_datos_completos(engine, tabla_pg)
-                    st.session_state["ss_df_pg_full"] = df_pg
-                    st.session_state["ss_pg_active"] = "pg_full"
-            except Exception as e:
-                st.error(str(e))
+                    st.session_state["ss_df_uoc"] = df_uoc
+                    st.session_state["ss_pg_active"] = "uoc"
+        except Exception as e:
+            st.error(f"Error en la conexión o consulta: {e}")
 
-        active = st.session_state.get("ss_pg_active")
-        if active == "uoc" and st.session_state.get("ss_df_uoc") is not None:
-            df_uoc = st.session_state["ss_df_uoc"]
-            if not df_uoc.empty:
-                st.success(f"Reporte generado con éxito: {len(df_uoc):,} registros.")
-                render_tablero(
-                    df_uoc,
-                    titulo="MSPBS – UOC Nivel Central (D.O.C)",
-                    key_prefix="tv_uoc",
-                    persist_complementarios_db=True,
-                )
-        elif active == "pg_full" and st.session_state.get("ss_df_pg_full") is not None:
-            df_pg = st.session_state["ss_df_pg_full"]
-            st.success(f"{len(df_pg):,} filas cargadas en total")
+    st.sidebar.markdown("---")
+
+    if st.sidebar.button("Leer tabla completa", key="btn_lectura_tabla"):
+        try:
+            engine = get_engine()
+            if not table_exists(engine, tabla_pg):
+                st.warning(f"No existe la tabla `{tabla_pg}` en public.")
+            else:
+                with st.spinner("Cargando todos los registros..."):
+                    df_pg = obtener_datos_completos(engine, tabla_pg)
+                st.session_state["ss_df_pg_full"] = df_pg
+                st.session_state["ss_pg_active"] = "pg_full"
+        except Exception as e:
+            st.error(str(e))
+
+    active = st.session_state.get("ss_pg_active")
+    if active == "uoc" and st.session_state.get("ss_df_uoc") is not None:
+        df_uoc = st.session_state["ss_df_uoc"]
+        if not df_uoc.empty:
+            st.success(f"Reporte generado con éxito: {len(df_uoc):,} registros.")
             render_tablero(
-                df_pg,
-                titulo="Vista desde Base de Datos (Supabase) — tabla completa",
-                key_prefix="tv_pg",
+                df_uoc,
+                titulo="MSPBS – UOC Nivel Central (D.O.C)",
+                key_prefix="tv_uoc",
                 persist_complementarios_db=True,
             )
+    elif active == "pg_full" and st.session_state.get("ss_df_pg_full") is not None:
+        df_pg = st.session_state["ss_df_pg_full"]
+        st.success(f"{len(df_pg):,} filas cargadas en total")
+        render_tablero(
+            df_pg,
+            titulo="Vista desde Base de Datos (Supabase) — tabla completa",
+            key_prefix="tv_pg",
+            persist_complementarios_db=True,
+        )
