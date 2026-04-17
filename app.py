@@ -8,6 +8,7 @@ import csv
 import os
 import re
 import tempfile
+import unicodedata
 from urllib.parse import quote_plus
 from datetime import date, datetime
 from pathlib import Path
@@ -48,6 +49,131 @@ def detect_delimiter(filepath: str, encoding: str = "utf-8") -> str:
         return csv.Sniffer().sniff(sample, delimiters=";,\t").delimiter
     except csv.Error:
         return ";" if sample.count(";") > sample.count(",") else ","
+
+
+def _ascii_key_header(name: object) -> str:
+    """Clave comparable para encabezados (quita tildes, pasa a minúsculas)."""
+    if name is None or (isinstance(name, float) and pd.isna(name)):
+        return ""
+    s = unicodedata.normalize("NFKD", str(name).strip()).encode("ascii", "ignore").decode().lower()
+    return re.sub(r"[^a-z0-9]+", "_", s).strip("_")
+
+
+def _map_columnas_por_clave(df: pd.DataFrame) -> dict[str, str]:
+    """Primera columna por cada clave normalizada."""
+    m: dict[str, str] = {}
+    for c in df.columns:
+        k = _ascii_key_header(c)
+        if k and k not in m:
+            m[k] = str(c)
+    return m
+
+
+def _leer_excel_formato_dmp_stock_critico(uploaded) -> pd.DataFrame:
+    """
+    Excel tipo 'Stock Crítico según DMP - MSPBS': título en fila 0,
+    encabezados (Código, Producto, …) en la siguiente fila útil.
+    """
+    raw = pd.read_excel(uploaded, sheet_name=0, header=None, engine="openpyxl")
+    header_ix: Optional[int] = None
+    for i in range(min(35, len(raw))):
+        cells = [_ascii_key_header(x) for x in raw.iloc[i].tolist()]
+        cells = [c for c in cells if c]
+        if not cells:
+            continue
+        if any(c == "codigo" or c.startswith("codigo_") for c in cells) and any(
+            "producto" in c for c in cells
+        ):
+            header_ix = i
+            break
+    if header_ix is None:
+        raise ValueError(
+            "No se detectó la fila de encabezados (se esperan columnas **Código** y **Producto**)."
+        )
+    headers: list[str] = []
+    for j in range(raw.shape[1]):
+        v = raw.iloc[header_ix, j]
+        headers.append(str(v).strip() if pd.notna(v) else f"col_{j}")
+    body = raw.iloc[header_ix + 1 :].copy()
+    body.columns = headers
+    body = body.dropna(how="all")
+    return body
+
+
+def preparar_dataframe_catalogo_stock(uploaded) -> pd.DataFrame:
+    """
+    Devuelve DataFrame con columnas codigo_siciap y descripcion_oficial.
+    Acepta CSV ya normalizado o Excel/CSV del formato DMP (Código + Producto + …).
+    """
+    name = (uploaded.name or "").lower()
+    if name.endswith(".csv"):
+        raw = pd.read_csv(uploaded, dtype=str, encoding="utf-8", on_bad_lines="skip")
+    elif name.endswith(".xlsx"):
+        uploaded.seek(0)
+        raw = _leer_excel_formato_dmp_stock_critico(uploaded)
+    else:
+        raise ValueError("Formato no soportado. Usá .csv o .xlsx.")
+
+    raw.columns = [str(c).strip() for c in raw.columns]
+    cm = _map_columnas_por_clave(raw)
+
+    cod_col = (
+        cm.get("codigo_siciap")
+        or cm.get("codigo")
+        or cm.get("codigo_simese")
+        or cm.get("codigo_dmp")
+    )
+    if not cod_col:
+        raise ValueError(
+            "No se encontró columna de código (Código / codigo_siciap). Columnas: "
+            + ", ".join(raw.columns[:20].tolist())
+        )
+
+    if "descripcion_oficial" in cm:
+        desc_col = cm["descripcion_oficial"]
+        out = raw[[cod_col, desc_col]].copy()
+        out.columns = ["codigo_siciap", "descripcion_oficial"]
+    else:
+        prod_col = cm.get("producto")
+        if not prod_col:
+            raise ValueError(
+                "No se encontró **Producto** ni **descripcion_oficial**. Columnas: "
+                + ", ".join(raw.columns[:20].tolist())
+            )
+        extra_keys = (
+            "concentracion",
+            "forma_farmaceutica",
+            "presentacion",
+            "clasificacion",
+        )
+        cols_desc = [prod_col]
+        for ek in extra_keys:
+            if ek in cm:
+                cols_desc.append(cm[ek])
+        def _armar_desc(row: pd.Series) -> str:
+            partes: list[str] = []
+            for c in cols_desc:
+                v = row.get(c, "")
+                if pd.isna(v):
+                    continue
+                t = str(v).strip()
+                if t and t.lower() not in ("nan", "none"):
+                    partes.append(t)
+            return " — ".join(partes)
+
+        out = pd.DataFrame(
+            {
+                "codigo_siciap": raw[cod_col].astype(str),
+                "descripcion_oficial": raw.apply(_armar_desc, axis=1),
+            }
+        )
+
+    out["codigo_siciap"] = out["codigo_siciap"].astype(str).str.strip()
+    out["descripcion_oficial"] = out["descripcion_oficial"].astype(str).str.strip()
+    out = out[out["codigo_siciap"] != ""]
+    out = out[out["descripcion_oficial"] != ""]
+    out = out.drop_duplicates(subset=["codigo_siciap"], keep="last")
+    return out
 
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -1218,7 +1344,7 @@ with tab_instr:
 
 5. En cada ítem podés abrir **Agendamiento de Entregas Parciales** para planificar entregas y, al recibir el camión, **Confirmar recepción** (actualiza automáticamente la cantidad entregada en la base).
 
-6. **Catálogo Stock Crítico** (sidebar): subí un CSV con `codigo_siciap` y `descripcion_oficial` para que la tabla muestre la descripción oficial cuando el ítem tenga ese código cargado.
+6. **Catálogo Stock Crítico** (sidebar): subí un **.xlsx** (descarga DMP/MSPBS) o un **CSV** con `codigo_siciap` y `descripcion_oficial` para que la tabla muestre la descripción oficial cuando el ítem tenga ese código cargado.
         """
     )
 
@@ -1254,33 +1380,23 @@ with tab_app:
 
     with st.sidebar.expander("⚙️ Cargar catálogo Stock Crítico", expanded=False):
         st.caption(
-            "CSV con columnas **codigo_siciap** y **descripcion_oficial** "
-            "(desde Excel: *Guardar como CSV*)."
+            "Archivo **.xlsx** (Stock Crítico DMP/MSPBS) o **CSV** con columnas "
+            "**codigo_siciap** y **descripcion_oficial**."
         )
-        cat_up = st.file_uploader("Archivo catálogo", type=["csv"], key="catalogo_stock_upload")
+        cat_up = st.file_uploader(
+            "Archivo catálogo", type=["csv", "xlsx"], key="catalogo_stock_upload"
+        )
         if st.button("Guardar catálogo en la nube", key="catalogo_stock_btn"):
             if cat_up is None:
-                st.error("Seleccioná un archivo CSV.")
+                st.error("Seleccioná un archivo (.csv o .xlsx).")
             else:
                 try:
-                    raw = pd.read_csv(cat_up, dtype=str, encoding="utf-8", on_bad_lines="skip")
-                    df_cat = raw.copy()
-                    df_cat.columns = (
-                        df_cat.columns.str.strip().str.lower().str.replace(" ", "_", regex=False)
-                    )
-                    for req in ("codigo_siciap", "descripcion_oficial"):
-                        if req not in df_cat.columns:
-                            raise ValueError(
-                                f"El CSV debe incluir las columnas codigo_siciap y descripcion_oficial (falta: {req})."
-                            )
-                    df_out = df_cat[["codigo_siciap", "descripcion_oficial"]].copy()
-                    df_out["codigo_siciap"] = df_out["codigo_siciap"].astype(str).str.strip()
-                    df_out["descripcion_oficial"] = (
-                        df_out["descripcion_oficial"].astype(str).str.strip()
-                    )
-                    df_out = df_out[df_out["codigo_siciap"] != ""]
+                    cat_up.seek(0)
+                    df_out = preparar_dataframe_catalogo_stock(cat_up)
                     if df_out.empty:
-                        raise ValueError("No quedaron filas con código SICIAP no vacío.")
+                        raise ValueError(
+                            "No quedaron filas válidas (código y descripción no vacíos)."
+                        )
                     eng = get_engine()
                     with eng.begin() as conn:
                         df_out.to_sql(
