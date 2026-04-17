@@ -893,7 +893,7 @@ def render_tablero(
             .configure_view(strokeWidth=0)
         )
 
-        st.altair_chart(chart, use_container_width=True)
+        st.altair_chart(chart, width="stretch")
 
     st.markdown("#### Tabla")
     work = d.copy()
