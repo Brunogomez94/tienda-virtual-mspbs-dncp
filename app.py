@@ -22,6 +22,12 @@ from sqlalchemy import create_engine, text
 if TYPE_CHECKING:
     from sqlalchemy.engine import Engine
 
+
+def is_localhost() -> bool:
+    """True en desarrollo típico en Windows local; False en Linux (p. ej. Streamlit Cloud)."""
+    return os.environ.get("OS") == "Windows_NT" or os.environ.get("COMPUTERNAME") is not None
+
+
 # ==========================================
 # 1. CONFIGURACIÓN
 # ==========================================
@@ -1293,19 +1299,11 @@ def render_tablero(
 def check_password() -> bool:
     """Retorna True si el usuario ingresó las credenciales correctas.
 
-    Roles: ``admin`` (carga CSV, catálogo stock) y ``operativo`` (solo tablero / BD).
-    Podés sobrescribir usuario y contraseña de admin con TV_ADMIN_USER y TV_ADMIN_PASSWORD.
-
     Nota: credenciales fijas son adecuadas solo para equipos cerrados; para mayor
     seguridad usá variables de entorno o un proveedor de identidad.
     """
-    admin_user = os.environ.get("TV_ADMIN_USER", "bruno_admin")
-    admin_pass = os.environ.get("TV_ADMIN_PASSWORD", "admin_dggies_2026")
-
     if "authenticated" not in st.session_state:
         st.session_state["authenticated"] = False
-    if "role" not in st.session_state:
-        st.session_state["role"] = None
 
     if st.session_state["authenticated"]:
         return True
@@ -1315,13 +1313,8 @@ def check_password() -> bool:
     password = st.sidebar.text_input("Contraseña", type="password", key="auth_pass")
 
     if st.sidebar.button("Entrar", key="auth_btn"):
-        if user == admin_user and password == admin_pass:
+        if user == "stock_dggies" and password == "stock_dggiesmspbs":
             st.session_state["authenticated"] = True
-            st.session_state["role"] = "admin"
-            st.rerun()
-        elif user == "stock_dggies" and password == "stock_dggiesmspbs":
-            st.session_state["authenticated"] = True
-            st.session_state["role"] = "operativo"
             st.rerun()
         else:
             st.sidebar.error("Usuario o contraseña incorrectos")
@@ -1338,138 +1331,140 @@ if not check_password():
     )
     st.stop()
 
-# Sesiones antiguas sin rol: tratar como operativo (sin funciones de admin).
-if st.session_state.get("authenticated") and st.session_state.get("role") is None:
-    st.session_state["role"] = "operativo"
-
-IS_ADMIN = st.session_state.get("role") == "admin"
-
-if IS_ADMIN:
-    tab_admin, tab_instr, tab_enlaces, tab_app = st.tabs(
-        [
-            "⚙️ Admin (Carga CSV)",
-            "📋 Instructivo",
-            "🔗 Enlaces DNCP",
-            "🛒 Aplicación",
-        ]
-    )
-else:
-    tab_instr, tab_enlaces, tab_app = st.tabs(
-        ["📋 Instructivo", "🔗 Enlaces DNCP", "🛒 Aplicación"]
-    )
+tab_instr, tab_enlaces, tab_carga, tab_app = st.tabs(
+    [
+        "📋 Instructivo",
+        "🔗 Enlaces DNCP",
+        "⬆️ Cargar Datos (DNCP)",
+        "🛒 Aplicación",
+    ]
+)
 
 with tab_instr:
     st.subheader("Instructivo de uso")
-    if IS_ADMIN:
-        st.markdown(
-            """
-1. Descargar datos: pestaña **Enlaces DNCP** (convenios prioritarios) o el enlace general:  
-   [Descarga CSV DNCP](https://www.contrataciones.gov.py/t/download/SieDocumento/10)
-
-2. Ir a la pestaña **Admin (Carga CSV)**, subir el archivo descargado y, si corresponde, usar **Cargar este DataFrame a la Base de Datos** (sobrescribe la tabla en la nube con los datos del CSV actual).
-
-3. Para gestionar la logística: pestaña **Aplicación** → panel lateral **Ver Reporte (MSPBS - UOC)** o **Leer tabla completa**.
-
-4. En cada ítem podés abrir **Agendamiento de Entregas Parciales** y **Confirmar recepción** cuando corresponda.
-
-5. **Catálogo Stock Crítico** (sidebar en **Aplicación**, solo admin): subí un **.xlsx** (DMP/MSPBS) o **CSV** con `codigo_siciap` y `descripcion_oficial` para enriquecer descripciones en el tablero.
-            """
-        )
-    else:
-        st.markdown(
-            """
-1. Enlaces útiles: pestaña **Enlaces DNCP** (convenios prioritarios) o la [descarga general CSV DNCP](https://www.contrataciones.gov.py/t/download/SieDocumento/10).
-
-2. Para trabajar con los datos cargados en el sistema: pestaña **Aplicación** → panel lateral **Ver Reporte (MSPBS - UOC)** o **Leer tabla completa**.
-
-3. En cada ítem podés abrir **Agendamiento de Entregas Parciales** y **Confirmar recepción** cuando corresponda.
-
-La carga masiva de archivos CSV y el catálogo «Stock Crítico» las realiza el **administrador** del sistema (perfil separado).
-            """
-        )
-
-with tab_enlaces:
-    st.subheader("Enlaces DNCP")
     st.markdown(
         """
-### Convenios prioritarios (Nivel Central / COVID)
+1. Descargar datos: pestaña **Enlaces DNCP** (tabla con **📥 Descargar CSV**) o el enlace general:  
+   [Descarga CSV DNCP](https://www.contrataciones.gov.py/t/download/SieDocumento/10)
 
-* [ID 400275 — Uso médico lucha COVID-19 Grupo 2](https://www.contrataciones.gov.py/convenios-marco/convenio/400275-adquisicion-productos-uso-medico-lucha-covid-19-grupo-2/compras.csv)
-* [ID 395261 — Midazolam y atracurio besilato](https://www.contrataciones.gov.py/convenios-marco/convenio/395261-adquisicion-midazolam-atracurio-besilato-lucha-covid-19/compras.csv)
-* [ID 386038 — Productos uso médico lucha COVID-19](https://www.contrataciones.gov.py/convenios-marco/convenio/386038-adquisicion-productos-uso-medico-lucha-covid-19/compras.csv)
-* [ID 382392 — Productos contingencia COVID-19](https://www.contrataciones.gov.py/convenios-marco/convenio/382392-adquisicion-productos-contingencia-covid-19/compras.csv)
+2. Ir a **⬆️ Cargar Datos (DNCP)**, subir el archivo y usar **Cargar este DataFrame a la Base de Datos** cuando corresponda (reemplaza la tabla en la nube según `TV_TABLE`).
 
-### Otros convenios
+3. Logística: pestaña **🛒 Aplicación** → panel lateral **Ver Reporte (MSPBS - UOC)** o **Leer tabla completa**.
 
-Acá podés sumar enlaces internos del equipo (portal interno, carpetas compartidas, etc.) según las necesidades operativas.
+4. En cada ítem podés usar **Agendamiento de Entregas Parciales** y **Confirmar recepción**.
+
+5. **Catálogo Stock Crítico** (solo en tu PC con Windows al ejecutar la app en local): aparece en el sidebar de **Aplicación** para subir el .xlsx/CSV DMP y enriquecer descripciones en el tablero. En la nube no se muestra.
         """
     )
 
-if IS_ADMIN:
-    with tab_admin:
+with tab_enlaces:
+    st.subheader("Convenios prioritarios (Nivel Central / COVID)")
+    datos_enlaces = [
+        {
+            "ID": "400275",
+            "Convenio": "Uso médico lucha COVID-19 Grupo 2",
+            "Enlace": "https://www.contrataciones.gov.py/convenios-marco/convenio/400275-adquisicion-productos-uso-medico-lucha-covid-19-grupo-2/compras.csv",
+        },
+        {
+            "ID": "395261",
+            "Convenio": "Midazolam y atracurio besilato",
+            "Enlace": "https://www.contrataciones.gov.py/convenios-marco/convenio/395261-adquisicion-midazolam-atracurio-besilato-lucha-covid-19/compras.csv",
+        },
+        {
+            "ID": "386038",
+            "Convenio": "Productos uso médico lucha COVID-19",
+            "Enlace": "https://www.contrataciones.gov.py/convenios-marco/convenio/386038-adquisicion-productos-uso-medico-lucha-covid-19/compras.csv",
+        },
+        {
+            "ID": "382392",
+            "Convenio": "Productos contingencia COVID-19",
+            "Enlace": "https://www.contrataciones.gov.py/convenios-marco/convenio/382392-adquisicion-productos-contingencia-covid-19/compras.csv",
+        },
+    ]
+    df_enlaces = pd.DataFrame(datos_enlaces)
+    st.dataframe(
+        df_enlaces,
+        column_config={
+            "ID": st.column_config.TextColumn("ID", width="small"),
+            "Convenio": st.column_config.TextColumn(
+                "Nombre del Convenio", width="large"
+            ),
+            "Enlace": st.column_config.LinkColumn(
+                "Acción", display_text="📥 Descargar CSV"
+            ),
+        },
+        hide_index=True,
+        width="stretch",
+    )
+    st.caption(
+        "Otros convenios o enlaces internos del equipo podés sumarlos aquí cuando amplíes la lista."
+    )
+
+with tab_carga:
+    st.caption(
+        "Vista previa del CSV y envío a Supabase (reemplaza la tabla configurada en `TV_TABLE`)."
+    )
+    tabla_pg = os.environ.get("TV_TABLE", DEFAULT_TABLE)
+
+    for _k in ("ss_df_uoc", "ss_df_pg_full", "ss_pg_active"):
+        st.session_state.pop(_k, None)
+
+    st.subheader("Cargar CSV")
+    uploaded = st.file_uploader(
+        "Subir CSV (tienda órdenes, reporte compras, etc.)",
+        type=["csv"],
+        key="carga_csv_upload",
+    )
+    ruta = st.text_input(
+        "O ruta absoluta a un .csv (solo útil en tu PC local)",
+        value="",
+        key="carga_csv_path",
+    )
+
+    df: pd.DataFrame | None = None
+    err = None
+    if uploaded is not None:
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
+                tmp.write(uploaded.getvalue())
+                path = tmp.name
+            df = read_csv_smart(path)
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        except Exception as e:
+            err = str(e)
+    elif ruta.strip():
+        try:
+            df = read_csv_smart(ruta.strip())
+        except Exception as e:
+            err = str(e)
+
+    if err:
+        st.error(err)
+    elif df is None:
+        st.info("Subí un archivo para visualizar los datos.")
+    else:
+        st.success(f"{len(df):,} filas × {len(df.columns)} columnas")
+        render_tablero(df, titulo="Vista desde archivo CSV", key_prefix="tv_csv_carga")
+
+        st.markdown("---")
+        st.subheader("Enviar a la base de datos (Supabase)")
         st.caption(
-            "Solo administración: vista previa del CSV y envío a Supabase "
-            "(reemplaza la tabla configurada en `TV_TABLE`)."
+            "La carga **reemplaza** por completo la tabla con los datos del CSV actual."
         )
-        tabla_pg = os.environ.get("TV_TABLE", DEFAULT_TABLE)
-
-        for _k in ("ss_df_uoc", "ss_df_pg_full", "ss_pg_active"):
-            st.session_state.pop(_k, None)
-
-        st.subheader("Cargar CSV")
-        uploaded = st.file_uploader(
-            "Subir CSV (tienda órdenes, reporte compras, etc.)",
-            type=["csv"],
-            key="admin_csv_upload",
-        )
-        ruta = st.text_input(
-            "O ruta absoluta a un .csv (solo útil en tu PC local)",
-            value="",
-            key="admin_csv_path",
-        )
-
-        df: pd.DataFrame | None = None
-        err = None
-        if uploaded is not None:
+        if st.button("Cargar este DataFrame a la Base de Datos", key="carga_btn_guardar_bd"):
             try:
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
-                    tmp.write(uploaded.getvalue())
-                    path = tmp.name
-                df = read_csv_smart(path)
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
+                esperado, verificado = subir_a_postgresql(
+                    df, tabla_pg, if_exists="replace"
+                )
+                st.success(
+                    f"✅ CARGA EXITOSA: **{verificado:,}** filas verificadas en la nube "
+                    f"(`public.{tabla_pg}`; CSV: {esperado:,})."
+                )
             except Exception as e:
-                err = str(e)
-        elif ruta.strip():
-            try:
-                df = read_csv_smart(ruta.strip())
-            except Exception as e:
-                err = str(e)
-
-        if err:
-            st.error(err)
-        elif df is None:
-            st.info("Subí un archivo para visualizar los datos.")
-        else:
-            st.success(f"{len(df):,} filas × {len(df.columns)} columnas")
-            render_tablero(df, titulo="Vista desde archivo CSV", key_prefix="tv_csv_admin")
-
-            st.markdown("---")
-            st.subheader("Enviar a la base de datos (Supabase)")
-            st.caption("La carga **reemplaza** por completo la tabla con los datos del CSV actual.")
-            if st.button("Cargar este DataFrame a la Base de Datos", key="admin_btn_cargar_bd"):
-                try:
-                    esperado, verificado = subir_a_postgresql(
-                        df, tabla_pg, if_exists="replace"
-                    )
-                    st.success(
-                        f"✅ CARGA EXITOSA: **{verificado:,}** filas verificadas en la nube "
-                        f"(`public.{tabla_pg}`; CSV: {esperado:,})."
-                    )
-                except Exception as e:
-                    st.error(f"❌ Error en la carga o verificación: {e}")
+                st.error(f"❌ Error en la carga o verificación: {e}")
 
 with tab_app:
     st.caption(
@@ -1479,8 +1474,10 @@ with tab_app:
 
     st.sidebar.markdown("---")
 
-    if IS_ADMIN:
-        with st.sidebar.expander("⚙️ Cargar catálogo Stock Crítico", expanded=False):
+    if is_localhost():
+        with st.sidebar.expander(
+            "⚙️ Cargar catálogo Stock Crítico (Solo Local)", expanded=False
+        ):
             st.caption(
                 "Archivo **.xlsx** (Stock Crítico DMP/MSPBS) o **CSV** con columnas "
                 "**codigo_siciap** y **descripcion_oficial**."
