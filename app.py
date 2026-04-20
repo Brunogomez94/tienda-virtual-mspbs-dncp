@@ -9,7 +9,6 @@ import os
 import re
 import tempfile
 import unicodedata
-from io import BytesIO
 from urllib.parse import quote_plus
 from datetime import date, datetime
 from pathlib import Path
@@ -37,23 +36,6 @@ DEFAULT_TABLE = os.environ.get("TV_TABLE", "contrataciones_datos")
 COMPLEMENTARIOS_TABLE = "datos_complementarios_oc"
 AGENDAMIENTOS_TABLE = "agendamientos_entregas"
 CATALOGO_STOCK_TABLE = "catalogo_stock_critico"
-
-# Convenios DNCP — `compras.csv` (separador `;`) → tablas Supabase `public.dncp_compras_<ID>`
-# y copia opcional en `data/dncp/`.
-DNCP_PAQUETE_DIR = Path(__file__).resolve().parent / "data" / "dncp"
-DNCP_ARCHIVOS_COMPRAS_LOCAL: dict[str, str] = {
-    "400275": "compras_400275.csv",
-    "395261": "compras_395261.csv",
-    "386038": "compras_386038.csv",
-    "382392": "compras_382392.csv",
-}
-
-DNCP_CONVENIOS_PRIORITARIOS: list[dict[str, str]] = [
-    {"id": "400275", "nombre": "Uso médico lucha COVID-19 Grupo 2"},
-    {"id": "395261", "nombre": "Midazolam y atracurio besilato"},
-    {"id": "386038", "nombre": "Productos uso médico lucha COVID-19"},
-    {"id": "382392", "nombre": "Productos contingencia COVID-19"},
-]
 
 POSTGRES_DEFAULTS = {
     "host": os.environ.get("POSTGRES_HOST", "localhost"),
@@ -770,36 +752,6 @@ def _coerce_types(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def leer_compras_csv_bytes(raw: bytes) -> pd.DataFrame:
-    """Parsea bytes de un compras.csv del DNCP (separador `;`)."""
-    for enc in ("utf-8-sig", "utf-8", "latin-1"):
-        try:
-            return pd.read_csv(
-                BytesIO(raw),
-                sep=";",
-                encoding=enc,
-                on_bad_lines="skip",
-                low_memory=False,
-            )
-        except UnicodeDecodeError:
-            continue
-    return pd.read_csv(
-        BytesIO(raw),
-        sep=";",
-        encoding_errors="replace",
-        on_bad_lines="skip",
-        low_memory=False,
-    )
-
-
-def tabla_dncp_compras_convenio(convenio_id: str) -> str:
-    """Nombre de tabla en Supabase: public.dncp_compras_<ID>."""
-    cid = str(convenio_id).strip()
-    if not cid.isdigit():
-        raise ValueError("ID de convenio inválido.")
-    return _validate_sql_identifier(f"dncp_compras_{cid}")
-
-
 def _aplicar_catalogo_stock_critico(d0: pd.DataFrame) -> pd.DataFrame:
     """LEFT JOIN con catalogo_stock_critico: si hay SICIAP, reemplaza n5 por descripcion_oficial."""
     if "n5" not in d0.columns or "codigo_siciap" not in d0.columns:
@@ -1428,8 +1380,7 @@ with tab_instr:
 1. Descarga general de datos DNCP (cuando necesités):  
    [Descarga CSV DNCP](https://www.contrataciones.gov.py/t/download/SieDocumento/10)
 
-2. En **⬆️ Cargar Datos (DNCP)** subís el CSV principal y usás **Cargar este DataFrame a la Base de Datos**
-   (`TV_TABLE`). Debajo podés cargar cada **`compras.csv` por convenio** en tablas **`public.dncp_compras_<ID>`**.
+2. En **⬆️ Cargar Datos (DNCP)** subís el CSV principal y usás **Cargar este DataFrame a la Base de Datos** (`TV_TABLE`).
 
 3. Logística: pestaña **🛒 Aplicación** → panel lateral **Ver Reporte (MSPBS - UOC)** o **Leer tabla completa**.
 
@@ -1504,46 +1455,6 @@ with tab_carga:
                 )
             except Exception as e:
                 st.error(f"❌ Error en la carga o verificación: {e}")
-
-    st.markdown("---")
-    st.subheader("Compras DNCP por convenio (Supabase)")
-    st.caption(
-        "Por cada convenio subís el `compras.csv` del DNCP (separador `;`): se **reemplaza** "
-        "**`public.dncp_compras_<ID>`** y se guarda una copia en **`data/dncp/`**."
-    )
-    _r1 = st.columns(2)
-    _r2 = st.columns(2)
-    _dncp_upload_cols = [_r1[0], _r1[1], _r2[0], _r2[1]]
-    for conv, _uc in zip(DNCP_CONVENIOS_PRIORITARIOS, _dncp_upload_cols):
-        _cid = conv["id"]
-        _fname = DNCP_ARCHIVOS_COMPRAS_LOCAL.get(_cid, f"compras_{_cid}.csv")
-        with _uc:
-            st.markdown(f"**{_cid}** · {conv['nombre']}")
-            _up = st.file_uploader(
-                f"CSV convenio {_cid}",
-                type=["csv"],
-                key=f"dncp_supabase_upl_{_cid}",
-                help="Archivo compras.csv del portal (separador ;).",
-            )
-            if st.button("Guardar en la nube", key=f"dncp_supabase_btn_{_cid}"):
-                if _up is None:
-                    st.error("Seleccioná el CSV antes de guardar.")
-                else:
-                    try:
-                        _raw = _up.getvalue()
-                        _df = leer_compras_csv_bytes(_raw)
-                        _tabla = tabla_dncp_compras_convenio(_cid)
-                        esperado, verificado = subir_a_postgresql(
-                            _df, _tabla, if_exists="replace"
-                        )
-                        DNCP_PAQUETE_DIR.mkdir(parents=True, exist_ok=True)
-                        (DNCP_PAQUETE_DIR / _fname).write_bytes(_raw)
-                        st.success(
-                            f"**{_cid}** → `public.{_tabla}`: **{verificado:,}** filas "
-                            f"(CSV: {esperado:,}). Copia guardada en **`data/dncp/{_fname}`**."
-                        )
-                    except Exception as e:
-                        st.error(f"Error al subir convenio {_cid}: {e}")
 
 with tab_app:
     st.caption(
