@@ -9,7 +9,6 @@ import os
 import re
 import tempfile
 import unicodedata
-import urllib.request
 from io import BytesIO
 from urllib.parse import quote_plus
 from datetime import date, datetime
@@ -39,11 +38,8 @@ COMPLEMENTARIOS_TABLE = "datos_complementarios_oc"
 AGENDAMIENTOS_TABLE = "agendamientos_entregas"
 CATALOGO_STOCK_TABLE = "catalogo_stock_critico"
 
-# Convenios DNCP — compras.csv (CSV usa separador ;)
-DNCP_HTTP_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; TiendaVirtualMSPBS/1.1)",
-}
-# CSV incluidos en `data/dncp/` (copiados desde los reportes DNCP; separador `;`).
+# Convenios DNCP — `compras.csv` (separador `;`) → tablas Supabase `public.dncp_compras_<ID>`
+# y copia opcional en `data/dncp/`.
 DNCP_PAQUETE_DIR = Path(__file__).resolve().parent / "data" / "dncp"
 DNCP_ARCHIVOS_COMPRAS_LOCAL: dict[str, str] = {
     "400275": "compras_400275.csv",
@@ -51,30 +47,12 @@ DNCP_ARCHIVOS_COMPRAS_LOCAL: dict[str, str] = {
     "386038": "compras_386038.csv",
     "382392": "compras_382392.csv",
 }
-# Vista pública típica de una orden de compra (portal DNCP usa el id de la primera columna del CSV).
-DNCP_URL_VER_OC_BASE = "https://www.contrataciones.gov.py/ordenes-de-compra/"
 
 DNCP_CONVENIOS_PRIORITARIOS: list[dict[str, str]] = [
-    {
-        "id": "400275",
-        "nombre": "Uso médico lucha COVID-19 Grupo 2",
-        "csv_url": "https://www.contrataciones.gov.py/convenios-marco/convenio/400275-adquisicion-productos-uso-medico-lucha-covid-19-grupo-2/compras.csv",
-    },
-    {
-        "id": "395261",
-        "nombre": "Midazolam y atracurio besilato",
-        "csv_url": "https://www.contrataciones.gov.py/convenios-marco/convenio/395261-adquisicion-midazolam-atracurio-besilato-lucha-covid-19/compras.csv",
-    },
-    {
-        "id": "386038",
-        "nombre": "Productos uso médico lucha COVID-19",
-        "csv_url": "https://www.contrataciones.gov.py/convenios-marco/convenio/386038-adquisicion-productos-uso-medico-lucha-covid-19/compras.csv",
-    },
-    {
-        "id": "382392",
-        "nombre": "Productos contingencia COVID-19",
-        "csv_url": "https://www.contrataciones.gov.py/convenios-marco/convenio/382392-adquisicion-productos-contingencia-covid-19/compras.csv",
-    },
+    {"id": "400275", "nombre": "Uso médico lucha COVID-19 Grupo 2"},
+    {"id": "395261", "nombre": "Midazolam y atracurio besilato"},
+    {"id": "386038", "nombre": "Productos uso médico lucha COVID-19"},
+    {"id": "382392", "nombre": "Productos contingencia COVID-19"},
 ]
 
 POSTGRES_DEFAULTS = {
@@ -792,27 +770,19 @@ def _coerce_types(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def fetch_compras_csv_dncp(url: str) -> pd.DataFrame:
-    """Descarga el CSV de compras del convenio marco (DNCP)."""
-    req = urllib.request.Request(url, headers=DNCP_HTTP_HEADERS)
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        raw = resp.read()
+def leer_compras_csv_bytes(raw: bytes) -> pd.DataFrame:
+    """Parsea bytes de un compras.csv del DNCP (separador `;`)."""
     for enc in ("utf-8-sig", "utf-8", "latin-1"):
-        for sep in (";", ","):
-            try:
-                df = pd.read_csv(
-                    BytesIO(raw),
-                    sep=sep,
-                    encoding=enc,
-                    on_bad_lines="skip",
-                    low_memory=False,
-                )
-                if len(df.columns) > 1:
-                    return df
-            except (UnicodeDecodeError, UnicodeError):
-                continue
-            except pd.errors.ParserError:
-                continue
+        try:
+            return pd.read_csv(
+                BytesIO(raw),
+                sep=";",
+                encoding=enc,
+                on_bad_lines="skip",
+                low_memory=False,
+            )
+        except UnicodeDecodeError:
+            continue
     return pd.read_csv(
         BytesIO(raw),
         sep=";",
@@ -822,130 +792,12 @@ def fetch_compras_csv_dncp(url: str) -> pd.DataFrame:
     )
 
 
-def metricas_oc_y_proveedores_compras(df: pd.DataFrame) -> tuple[int, str]:
-    """Órdenes de compra distintas y texto resumido de proveedores."""
-    if df is None or df.empty:
-        return 0, "—"
-    col_oc = _pick(df, ("nro_orden_compra",))
-    if col_oc:
-        s = df[col_oc].astype(str).str.strip()
-        s = s[
-            (s != "")
-            & (~s.str.lower().isin(("nan", "none", "nat")))
-        ]
-        n_oc = int(s.nunique())
-    else:
-        n_oc = int(len(df.index))
-    col_pr = _pick(df, ("proveedor", "Proveedor"))
-    if not col_pr:
-        return n_oc, "—"
-    provs = df[col_pr].dropna().astype(str).str.strip()
-    provs = provs[(provs != "") & (~provs.str.lower().isin(("nan",)))]
-    uniq = sorted(provs.unique().tolist())
-    if not uniq:
-        return n_oc, "—"
-    if len(uniq) <= 2:
-        return n_oc, "; ".join(uniq)
-    return (
-        n_oc,
-        f"{len(uniq)} proveedores · {uniq[0]}; {uniq[1]}; …",
-    )
-
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def resumen_convenio_dncp_cached(csv_url: str) -> dict[str, object]:
-    """Datos agregados desde compras.csv (caché 30 min)."""
-    try:
-        df = fetch_compras_csv_dncp(csv_url)
-        n_oc, prov_txt = metricas_oc_y_proveedores_compras(df)
-        return {
-            "ok": True,
-            "n_oc": n_oc,
-            "proveedores": prov_txt,
-            "filas": len(df),
-        }
-    except Exception as e:
-        return {"ok": False, "error": str(e)[:400]}
-
-
-def leer_compras_csv_local(path: Path) -> pd.DataFrame:
-    """Lee un compras.csv exportado del DNCP (local)."""
-    for enc in ("utf-8-sig", "utf-8", "latin-1"):
-        try:
-            return pd.read_csv(
-                path,
-                sep=";",
-                encoding=enc,
-                on_bad_lines="skip",
-                low_memory=False,
-            )
-        except UnicodeDecodeError:
-            continue
-    return pd.read_csv(
-        path,
-        sep=";",
-        encoding_errors="replace",
-        on_bad_lines="skip",
-        low_memory=False,
-    )
-
-
-def url_publica_orden_compra_dncp(oc_id: object) -> str:
-    """Arma la URL de la OC en el portal (columna `id` del CSV)."""
-    s = str(oc_id).strip()
-    if not s or s.lower() in ("nan", "none", ""):
-        return ""
-    return f"{DNCP_URL_VER_OC_BASE}{s}"
-
-
-@st.cache_data(show_spinner=False)
-def detalle_ordenes_dncp_desde_paquete_local() -> pd.DataFrame:
-    """
-    Lee `data/dncp/compras_*.csv` y une las cuatro fuentes.
-    Columnas de salida: ID convenio, orden, fecha, proveedor, enlace al portal.
-    """
-    partes: list[pd.DataFrame] = []
-    for conv in DNCP_CONVENIOS_PRIORITARIOS:
-        cid = conv["id"]
-        fname = DNCP_ARCHIVOS_COMPRAS_LOCAL.get(cid)
-        if not fname:
-            continue
-        path = DNCP_PAQUETE_DIR / fname
-        if not path.is_file():
-            continue
-        df = leer_compras_csv_local(path)
-        d = df.copy()
-        d["_convenio_id"] = cid
-        partes.append(d)
-    if not partes:
-        return pd.DataFrame()
-    todo = pd.concat(partes, ignore_index=True)
-    if "fecha_orden_compra" in todo.columns:
-        fechas = pd.to_datetime(todo["fecha_orden_compra"], errors="coerce")
-        todo["Fecha de emisión"] = fechas.dt.strftime("%Y-%m-%d %H:%M")
-    else:
-        todo["Fecha de emisión"] = ""
-    if "nro_orden_compra" in todo.columns:
-        todo["Orden de compra"] = todo["nro_orden_compra"].astype(str).str.strip()
-    else:
-        todo["Orden de compra"] = ""
-    if "proveedor" in todo.columns:
-        todo["Proveedor"] = todo["proveedor"].astype(str).str.strip()
-    else:
-        todo["Proveedor"] = ""
-    if "id" not in todo.columns:
-        return pd.DataFrame()
-    todo["Ver OC (DNCP)"] = todo["id"].apply(url_publica_orden_compra_dncp)
-    vista = todo[
-        [
-            "_convenio_id",
-            "Orden de compra",
-            "Fecha de emisión",
-            "Proveedor",
-            "Ver OC (DNCP)",
-        ]
-    ].rename(columns={"_convenio_id": "ID convenio"})
-    return vista
+def tabla_dncp_compras_convenio(convenio_id: str) -> str:
+    """Nombre de tabla en Supabase: public.dncp_compras_<ID>."""
+    cid = str(convenio_id).strip()
+    if not cid.isdigit():
+        raise ValueError("ID de convenio inválido.")
+    return _validate_sql_identifier(f"dncp_compras_{cid}")
 
 
 def _aplicar_catalogo_stock_critico(d0: pd.DataFrame) -> pd.DataFrame:
@@ -1561,10 +1413,9 @@ if not check_password():
     )
     st.stop()
 
-tab_instr, tab_enlaces, tab_carga, tab_app = st.tabs(
+tab_instr, tab_carga, tab_app = st.tabs(
     [
         "📋 Instructivo",
-        "🔗 Enlaces DNCP",
         "⬆️ Cargar Datos (DNCP)",
         "🛒 Aplicación",
     ]
@@ -1574,10 +1425,11 @@ with tab_instr:
     st.subheader("Instructivo de uso")
     st.markdown(
         """
-1. **Enlaces DNCP:** tabla de órdenes con enlace al portal; datos desde `data/dncp/`. Descarga general:  
+1. Descarga general de datos DNCP (cuando necesités):  
    [Descarga CSV DNCP](https://www.contrataciones.gov.py/t/download/SieDocumento/10)
 
-2. Ir a **⬆️ Cargar Datos (DNCP)**, subir el archivo y usar **Cargar este DataFrame a la Base de Datos** cuando corresponda (reemplaza la tabla en la nube según `TV_TABLE`).
+2. En **⬆️ Cargar Datos (DNCP)** subís el CSV principal y usás **Cargar este DataFrame a la Base de Datos**
+   (`TV_TABLE`). Debajo podés cargar cada **`compras.csv` por convenio** en tablas **`public.dncp_compras_<ID>`**.
 
 3. Logística: pestaña **🛒 Aplicación** → panel lateral **Ver Reporte (MSPBS - UOC)** o **Leer tabla completa**.
 
@@ -1586,61 +1438,6 @@ with tab_instr:
 5. **Catálogo Stock Crítico** (solo en tu PC con Windows al ejecutar la app en local): aparece en el sidebar de **Aplicación** para subir el .xlsx/CSV DMP y enriquecer descripciones en el tablero. En la nube no se muestra.
         """
     )
-
-with tab_enlaces:
-    st.subheader("Órdenes de compra — enlaces DNCP")
-    st.caption(
-        "Lista armada desde los CSV en **`data/dncp/`** (reportes tipo `compras.csv`, separador `;`). "
-        "**🔍 Ver OC** abre la orden en el portal. Botón **Recargar** tras reemplazar archivos."
-    )
-    faltan = [
-        DNCP_PAQUETE_DIR / fn
-        for fn in DNCP_ARCHIVOS_COMPRAS_LOCAL.values()
-        if not (DNCP_PAQUETE_DIR / fn).is_file()
-    ]
-    if faltan:
-        st.warning(
-            "Faltan archivos en **data/dncp/**: "
-            + ", ".join(p.name for p in faltan)
-        )
-
-    if st.button("🔄 Recargar desde archivos locales", key="dncp_reload_local"):
-        detalle_ordenes_dncp_desde_paquete_local.clear()
-        st.rerun()
-
-    with st.spinner("Leyendo CSV locales…"):
-        df_detalle = detalle_ordenes_dncp_desde_paquete_local()
-
-    st.caption(
-        "Si un enlace no abre, buscá la **orden de compra** en el sitio del DNCP "
-        "(el portal a veces cambia rutas)."
-    )
-    if df_detalle.empty:
-        st.warning(
-            "No hay filas para mostrar. Copiá los cuatro `compras_*.csv` en "
-            f"`{DNCP_PAQUETE_DIR}` y volvé a **Recargar**."
-        )
-    else:
-        st.dataframe(
-            df_detalle,
-            column_config={
-                "ID convenio": st.column_config.TextColumn("ID convenio", width="small"),
-                "Orden de compra": st.column_config.TextColumn(
-                    "Orden de compra", width="medium"
-                ),
-                "Fecha de emisión": st.column_config.TextColumn(
-                    "Fecha de emisión", width="medium"
-                ),
-                "Proveedor": st.column_config.TextColumn("Proveedor", width="large"),
-                "Ver OC (DNCP)": st.column_config.LinkColumn(
-                    "Abrir en web", display_text="🔗 Ver OC"
-                ),
-            },
-            hide_index=True,
-            width="stretch",
-            height=520,
-        )
-        st.caption(f"**{len(df_detalle):,}** filas · cuatro convenios COVID / priorización.")
 
 with tab_carga:
     st.caption(
@@ -1707,6 +1504,46 @@ with tab_carga:
                 )
             except Exception as e:
                 st.error(f"❌ Error en la carga o verificación: {e}")
+
+    st.markdown("---")
+    st.subheader("Compras DNCP por convenio (Supabase)")
+    st.caption(
+        "Por cada convenio subís el `compras.csv` del DNCP (separador `;`): se **reemplaza** "
+        "**`public.dncp_compras_<ID>`** y se guarda una copia en **`data/dncp/`**."
+    )
+    _r1 = st.columns(2)
+    _r2 = st.columns(2)
+    _dncp_upload_cols = [_r1[0], _r1[1], _r2[0], _r2[1]]
+    for conv, _uc in zip(DNCP_CONVENIOS_PRIORITARIOS, _dncp_upload_cols):
+        _cid = conv["id"]
+        _fname = DNCP_ARCHIVOS_COMPRAS_LOCAL.get(_cid, f"compras_{_cid}.csv")
+        with _uc:
+            st.markdown(f"**{_cid}** · {conv['nombre']}")
+            _up = st.file_uploader(
+                f"CSV convenio {_cid}",
+                type=["csv"],
+                key=f"dncp_supabase_upl_{_cid}",
+                help="Archivo compras.csv del portal (separador ;).",
+            )
+            if st.button("Guardar en la nube", key=f"dncp_supabase_btn_{_cid}"):
+                if _up is None:
+                    st.error("Seleccioná el CSV antes de guardar.")
+                else:
+                    try:
+                        _raw = _up.getvalue()
+                        _df = leer_compras_csv_bytes(_raw)
+                        _tabla = tabla_dncp_compras_convenio(_cid)
+                        esperado, verificado = subir_a_postgresql(
+                            _df, _tabla, if_exists="replace"
+                        )
+                        DNCP_PAQUETE_DIR.mkdir(parents=True, exist_ok=True)
+                        (DNCP_PAQUETE_DIR / _fname).write_bytes(_raw)
+                        st.success(
+                            f"**{_cid}** → `public.{_tabla}`: **{verificado:,}** filas "
+                            f"(CSV: {esperado:,}). Copia guardada en **`data/dncp/{_fname}`**."
+                        )
+                    except Exception as e:
+                        st.error(f"Error al subir convenio {_cid}: {e}")
 
 with tab_app:
     st.caption(
