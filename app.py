@@ -5,6 +5,7 @@ Versión unificada para despliegue web (p. ej. Streamlit Community Cloud).
 from __future__ import annotations
 
 import csv
+import math
 import os
 import re
 import tempfile
@@ -230,48 +231,72 @@ def dataframe_to_postgres(
     table_name: str,
     schema: str = "public",
     if_exists: str = "replace",
-    chunksize: int = 500,
+    chunksize: int = 2000,
 ) -> tuple[int, int]:
     """
-    Carga el DataFrame en public.<tabla> con transacción explícita.
-    Paquetes pequeños (500) + method='multi' para inserciones eficientes pero controladas.
-    Devuelve (filas en el DataFrame, filas contadas en BD tras COMMIT).
+    Carga el DataFrame en public.<tabla> por lotes con `st.progress` entre lotes.
+
+    En Streamlit Cloud el WebSocket puede cortarse si el hilo no “habla” con el navegador
+    durante mucho tiempo; actualizar la barra evita el error 1011 (keepalive ping timeout).
+    Cada lote usa su propia conexión/transacción vía `con=engine`, más compatible con el
+    pooler de Supabase (puerto 6543) que transacciones enormes abiertas.
+    Devuelve (filas en el DataFrame, filas contadas en BD tras la carga).
     """
-    # Siempre public: evita confusiones con otros esquemas.
     schema = "public"
     table_name = _validate_sql_identifier(table_name)
     expected = len(df)
 
     def _count_rows() -> int:
         with engine.connect() as conn:
-            r = conn.execute(
-                text(f"SELECT COUNT(*) FROM public.{table_name}")
-            ).scalar()
+            r = conn.execute(text(f"SELECT COUNT(*) FROM public.{table_name}")).scalar()
         return int(r or 0)
 
     rows_before = 0
     if if_exists == "append" and table_exists(engine, table_name):
         rows_before = _count_rows()
 
+    texto_progreso = f"Subiendo {expected:,} filas a la nube…"
+    prog_bar = st.progress(0, text=texto_progreso)
     try:
-        with engine.begin() as conn:
-            # replace: limpiar antes de crear de nuevo (evita choques de esquema / restos)
-            if if_exists == "replace":
+        if if_exists == "replace":
+            with engine.begin() as conn:
                 conn.execute(text(f"DROP TABLE IF EXISTS public.{table_name} CASCADE"))
-            # Tras DROP, siempre append (tabla nueva); en modo append, agregar a la existente
+
+        if expected == 0:
             df.to_sql(
                 table_name,
-                con=conn,
+                con=engine,
                 schema=schema,
                 if_exists="append",
                 index=False,
-                chunksize=chunksize,
                 method="multi",
             )
+            prog_bar.progress(1.0, text="Listo (0 filas).")
+        else:
+            total_chunks = math.ceil(expected / chunksize)
+            for i in range(total_chunks):
+                start = i * chunksize
+                end = (i + 1) * chunksize
+                chunk = df.iloc[start:end]
+                chunk.to_sql(
+                    table_name,
+                    con=engine,
+                    schema=schema,
+                    if_exists="append",
+                    index=False,
+                    chunksize=chunksize,
+                    method="multi",
+                )
+                prog_bar.progress(
+                    (i + 1) / total_chunks,
+                    text=f"Subiendo lote {i + 1} de {total_chunks}…",
+                )
     except Exception as e:
         raise RuntimeError(
             f"Falló la carga en la base de datos (public.{table_name}): {e}"
         ) from e
+    finally:
+        prog_bar.empty()
 
     rows_after = _count_rows()
 
@@ -932,8 +957,7 @@ def render_tablero(
             .configure_view(strokeWidth=0)
         )
 
-        # `altair_chart` no admite `width=` en todas las versiones; `use_container_width` sigue siendo válido aquí.
-        st.altair_chart(chart, use_container_width=True)
+        st.altair_chart(chart, width="stretch")
 
     st.markdown("#### Tabla")
     work = d.copy()
